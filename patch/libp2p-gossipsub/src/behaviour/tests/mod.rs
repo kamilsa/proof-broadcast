@@ -32,6 +32,7 @@
 
 mod explicit_peers;
 mod floodsub;
+mod gated;
 mod gossip;
 mod graft_prune;
 mod idontwant;

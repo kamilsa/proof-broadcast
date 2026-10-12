@@ -54,6 +54,75 @@ impl ChunkMessage {
     }
 }
 
+/// Bytes of a bincode [`ChunkMessage`] before its data: subnet, prover,
+/// committees, index, chunk_count, proof_len, hash.
+const CHUNK_HEADER_LEN: usize = 2 + 2 + 8 + 2 + 2 + 4 + 32;
+
+/// `gossipsub-chunked-pull`: the group of a chunk on the pull-gated topic —
+/// its proof's group id — read from the fixed-size prefix without decoding
+/// the data. Installed with `gossipsub::Behaviour::gate_topic`.
+pub fn chunk_group(data: &[u8]) -> Option<Vec<u8>> {
+    let b = data.get(..CHUNK_HEADER_LEN)?;
+    let u16_at = |i: usize| u16::from_le_bytes([b[i], b[i + 1]]);
+    let mut hash = [0u8; 32];
+    hash.copy_from_slice(&b[20..52]);
+    ProofId::from_header(
+        u16_at(0),
+        u16_at(2),
+        u64::from_le_bytes(b[4..12].try_into().ok()?),
+        u32::from_le_bytes(b[16..20].try_into().ok()?),
+        u16_at(14),
+        hash,
+    )
+    .map(|id| id.group_id())
+}
+
+/// `gossipsub-chunked-pull`: announces a proof on `/proofs_headers/1`. An L2
+/// that chooses it asks the sender for its chunks (WANT); one that does not
+/// never receives a single chunk of it. bincode lays it out as `subnet u16 ||
+/// prover u16 || committees u64 || ..` (LE), which the wire tracer relies on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HeaderMessage {
+    pub subnet: u16,
+    pub prover: u16,
+    pub committees: Committees,
+    pub chunk_count: u16,
+    pub proof_len: u32,
+    pub hash: [u8; 32],
+}
+
+impl HeaderMessage {
+    pub fn new(id: &ProofId) -> Self {
+        Self {
+            subnet: id.subnet,
+            prover: id.prover,
+            committees: id.committees,
+            chunk_count: id.chunk_count,
+            proof_len: id.proof_len,
+            hash: id.hash,
+        }
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        bincode::serialize(self).expect("serialize header message")
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, bincode::Error> {
+        bincode::deserialize(bytes)
+    }
+
+    pub fn id(&self) -> Option<ProofId> {
+        ProofId::from_header(
+            self.subnet,
+            self.prover,
+            self.committees,
+            self.proof_len,
+            self.chunk_count,
+            self.hash,
+        )
+    }
+}
+
 /// Every chunk of `proof`, in index order.
 pub fn chunk_messages(id: &ProofId, proof: &[u8]) -> Vec<ChunkMessage> {
     split(proof, id.chunks())
@@ -120,6 +189,34 @@ mod tests {
         assert_eq!(&bytes[2..4], &7u16.to_le_bytes());
         assert_eq!(&bytes[4..12], &mask.to_le_bytes());
         assert_eq!(&bytes[12..14], &3u16.to_le_bytes());
+    }
+
+    #[test]
+    fn chunk_group_is_the_proof_group_id() {
+        let proof = make_proof(3, 1000);
+        let id = ProofId::for_proof(2, 1, &proof, 8);
+        for chunk in chunk_messages(&id, &proof) {
+            assert_eq!(chunk_group(&chunk.encode()), Some(id.group_id()));
+        }
+        assert_eq!(chunk_group(&[0u8; 10]), None);
+        let mut bad = chunk_messages(&id, &proof)[0].clone();
+        bad.committees = 0b11;
+        assert_eq!(chunk_group(&bad.encode()), None);
+    }
+
+    #[test]
+    fn header_round_trip_and_layout() {
+        let mask = mask_of(&[1, 2]);
+        let proof = make_aggregate(1, mask, 64);
+        let id = ProofId::for_aggregate(7, mask, &proof, 4);
+        let bytes = HeaderMessage::new(&id).encode();
+        assert_eq!(HeaderMessage::decode(&bytes).unwrap().id(), Some(id));
+        assert_eq!(&bytes[..2], &AGGREGATE_SUBNET.to_le_bytes());
+        assert_eq!(&bytes[2..4], &7u16.to_le_bytes());
+        assert_eq!(&bytes[4..12], &mask.to_le_bytes());
+        let mut bad = HeaderMessage::new(&id);
+        bad.committees = 0b100;
+        assert!(bad.id().is_none());
     }
 
     #[test]

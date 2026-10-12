@@ -27,6 +27,21 @@ pub fn proofs_chunked_topic() -> IdentTopic {
     IdentTopic::new(TOPIC_PROOFS_CHUNKED)
 }
 
+/// `gossipsub-chunked-pull`: proof headers (ordinary gossipsub).
+pub const TOPIC_PROOFS_HEADERS: &str = "/proofs_headers/1";
+
+pub fn proofs_headers_topic() -> IdentTopic {
+    IdentTopic::new(TOPIC_PROOFS_HEADERS)
+}
+
+/// `gossipsub-chunked-pull`: chunks on a pull-gated topic — sent only to
+/// peers that asked for their proof.
+pub const TOPIC_PROOFS_CHUNKED_PULL: &str = "/proofs_chunked_pull/1";
+
+pub fn proofs_chunked_pull_topic() -> IdentTopic {
+    IdentTopic::new(TOPIC_PROOFS_CHUNKED_PULL)
+}
+
 #[derive(NetworkBehaviour)]
 pub struct SimBehaviour {
     pub gossipsub: gossipsub::Behaviour,

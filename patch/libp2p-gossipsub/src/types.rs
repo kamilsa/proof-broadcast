@@ -283,6 +283,17 @@ pub enum ControlAction {
     IDontWant(IDontWant),
     /// The Node has sent us its supported extensions.
     Extensions(Option<Extensions>),
+    /// proof-broadcast: the node asks for the messages of these groups on a
+    /// pull-gated topic.
+    WantGroup(WantGroup),
+}
+
+/// proof-broadcast: ask for the messages of `groups` on a pull-gated topic
+/// (see [`crate::Behaviour::gate_topic`]).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct WantGroup {
+    pub(crate) topic_hash: TopicHash,
+    pub(crate) groups: Vec<Vec<u8>>,
 }
 
 /// Node broadcasts known messages per topic - IHave control message.
@@ -364,6 +375,8 @@ pub enum RpcOut {
     /// The node requests us to not forward message ids (peer_id + sequence _number) - IDontWant
     /// control message.
     IDontWant(IDontWant),
+    /// proof-broadcast: ask for the messages of groups on a pull-gated topic.
+    WantGroup(WantGroup),
     /// Send a Extensions control message.
     Extensions(Extensions),
     /// Send a test extension message.
@@ -390,6 +403,7 @@ impl RpcOut {
                 | RpcOut::Graft(_)
                 | RpcOut::Prune(_)
                 | RpcOut::IDontWant(_)
+                | RpcOut::WantGroup(_)
         )
     }
 }
@@ -462,6 +476,7 @@ impl From<RpcOut> for proto::Rpc {
                     prune: vec![],
                     idontwant: vec![],
                     extensions: None,
+                    wantgroup: vec![],
                 }),
                 partial: None,
             },
@@ -477,6 +492,7 @@ impl From<RpcOut> for proto::Rpc {
                     prune: vec![],
                     idontwant: vec![],
                     extensions: None,
+                    wantgroup: vec![],
                 }),
                 partial: None,
             },
@@ -492,6 +508,7 @@ impl From<RpcOut> for proto::Rpc {
                     prune: vec![],
                     idontwant: vec![],
                     extensions: None,
+                    wantgroup: vec![],
                 }),
                 partial: None,
             },
@@ -521,6 +538,7 @@ impl From<RpcOut> for proto::Rpc {
                         }],
                         idontwant: vec![],
                         extensions: None,
+                        wantgroup: vec![],
                     }),
                     partial: None,
                 }
@@ -537,6 +555,19 @@ impl From<RpcOut> for proto::Rpc {
                         message_ids: message_ids.into_iter().map(|msg_id| msg_id.0).collect(),
                     }],
                     extensions: None,
+                    wantgroup: vec![],
+                }),
+                partial: None,
+            },
+            RpcOut::WantGroup(WantGroup { topic_hash, groups }) => proto::Rpc {
+                publish: Vec::new(),
+                subscriptions: Vec::new(),
+                control: Some(proto::ControlMessage {
+                    wantgroup: vec![proto::ControlWantGroup {
+                        topic_id: Some(topic_hash.into_string()),
+                        group_ids: groups,
+                    }],
+                    ..Default::default()
                 }),
                 partial: None,
             },
@@ -550,6 +581,7 @@ impl From<RpcOut> for proto::Rpc {
                     prune: vec![],
                     idontwant: vec![],
                     extensions: Some(proto::ControlExtensions { partial_messages }),
+                    wantgroup: vec![],
                 }),
                 partial: None,
             },

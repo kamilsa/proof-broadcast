@@ -60,6 +60,7 @@ use crate::{
     FailedMessages, PublishError, SubscriptionError, TopicScoreParams, ValidationError,
     backoff::BackoffStorage,
     config::{Config, ValidationMode},
+    gated::{GatedTopic, GroupFn},
     gossip_promises::GossipPromises,
     handler::{Handler, HandlerEvent, HandlerIn},
     mcache::MessageCache,
@@ -75,7 +76,7 @@ use crate::{
     types::{
         ControlAction, Extensions, Graft, IDontWant, IHave, IWant, Message, MessageAcceptance,
         MessageId, PeerDetails, PeerInfo, PeerKind, Prune, RawMessage, RpcOut, Subscription,
-        SubscriptionAction,
+        SubscriptionAction, WantGroup,
     },
 };
 #[cfg(feature = "partial-messages")]
@@ -388,6 +389,9 @@ pub struct Behaviour<D = IdentityTransform, F = AllowAllSubscriptionFilter> {
 
     /// Tracks recently sent `IWANT` messages and checks if peers respond to them.
     gossip_promises: GossipPromises,
+
+    /// proof-broadcast: pull-gated topics (see [`Behaviour::gate_topic`]).
+    gated: HashMap<TopicHash, GatedTopic>,
 }
 
 impl<D, F> Behaviour<D, F>
@@ -504,6 +508,7 @@ where
             #[cfg(feature = "partial-messages")]
             partial_traffic: Default::default(),
             traffic: Default::default(),
+            gated: HashMap::new(),
         })
     }
 
@@ -641,6 +646,9 @@ where
     ) -> Result<MessageId, PublishError> {
         let data = data.into();
         let topic = topic.into();
+        // proof-broadcast: on a pull-gated topic, only peers that asked for
+        // the message's group get it (now or when they ask).
+        let gated_group = self.gated.get(&topic).and_then(|gated| gated.group(&data));
 
         // Transform the data before building a raw_message.
         let transformed_data = self
@@ -679,6 +687,12 @@ where
         }
 
         tracing::trace!(message_id=%msg_id, "Publishing message");
+
+        if let Some(group) = gated_group {
+            self.duplicate_cache.insert(msg_id.clone());
+            self.send_gated(&group, &msg_id, &raw_message, None, &HashSet::new());
+            return Ok(msg_id);
+        }
 
         let topic_hash = raw_message.topic.clone();
 
@@ -798,6 +812,97 @@ where
             }
         }
         sent
+    }
+
+    /// proof-broadcast: make `topic` pull-gated. Each message's group is
+    /// `group_fn(data)`; a message with a group is published or forwarded only
+    /// to peers that asked for that group with [`Self::want_group`] (whenever
+    /// they ask, they first get what we already hold). Messages without a
+    /// group are handled as usual.
+    pub fn gate_topic(&mut self, topic: impl Into<TopicHash>, group_fn: GroupFn) {
+        self.gated.insert(topic.into(), GatedTopic::new(group_fn));
+    }
+
+    /// proof-broadcast: ask `peer` for the messages of `groups` on the
+    /// pull-gated `topic`. Returns whether the request was queued.
+    pub fn want_group(
+        &mut self,
+        topic: impl Into<TopicHash>,
+        groups: Vec<Vec<u8>>,
+        peer: PeerId,
+    ) -> bool {
+        if groups.is_empty() {
+            return false;
+        }
+        let topic_hash = topic.into();
+        self.send_message(peer, RpcOut::WantGroup(WantGroup { topic_hash, groups }))
+    }
+
+    /// A peer asked for groups on a gated topic: remember it, and send it
+    /// what we already hold of them.
+    fn handle_want_group(&mut self, peer_id: &PeerId, topic: TopicHash, groups: Vec<Vec<u8>>) {
+        let Some(gated) = self.gated.get_mut(&topic) else {
+            tracing::debug!(peer=%peer_id, %topic, "WANT for a topic that is not gated");
+            return;
+        };
+        let held: Vec<_> = groups
+            .into_iter()
+            .flat_map(|group| gated.want(*peer_id, group))
+            .collect();
+        for (message_id, message) in held {
+            if self
+                .connected_peers
+                .get(peer_id)
+                .is_none_or(|peer| peer.dont_send.contains_key(&message_id))
+            {
+                continue;
+            }
+            self.send_message(
+                *peer_id,
+                RpcOut::Publish {
+                    message_id,
+                    message,
+                    timeout: Delay::new(self.config.forward_queue_duration()),
+                },
+            );
+        }
+    }
+
+    /// Send a gated message to the peers that asked for its group, except
+    /// `exclude` (its sender and source), and keep it for later askers.
+    fn send_gated(
+        &mut self,
+        group: &[u8],
+        msg_id: &MessageId,
+        message: &RawMessage,
+        from: Option<&PeerId>,
+        exclude: &HashSet<PeerId>,
+    ) {
+        let Some(gated) = self.gated.get_mut(&message.topic) else {
+            return;
+        };
+        gated.store(group, msg_id, message, from.copied());
+        let wanters = gated.wanters(group);
+        for peer_id in wanters {
+            if Some(&peer_id) == from
+                || exclude.contains(&peer_id)
+                || Some(&peer_id) == message.source.as_ref()
+                || self
+                    .connected_peers
+                    .get(&peer_id)
+                    .is_none_or(|peer| peer.dont_send.contains_key(msg_id))
+            {
+                continue;
+            }
+            self.send_message(
+                peer_id,
+                RpcOut::Publish {
+                    message_id: msg_id.clone(),
+                    message: message.clone(),
+                    timeout: Delay::new(self.config.forward_queue_duration()),
+                },
+            );
+        }
     }
 
     /// Get all peers on the topic that have a sufficiently high score to allow publishing.
@@ -2891,6 +2996,10 @@ where
         let mut rng = thread_rng();
         let mut messages = Vec::new();
         for (topic_hash, peers) in self.mesh.iter().chain(self.fanout.iter()) {
+            // proof-broadcast: gated messages are never advertised.
+            if self.gated.contains_key(topic_hash) {
+                continue;
+            }
             let mut message_ids = self.mcache.get_gossip_message_ids(topic_hash);
             if message_ids.is_empty() {
                 continue;
@@ -3063,6 +3172,17 @@ where
         }
 
         tracing::debug!(message_id=%msg_id, "Forwarding message");
+
+        // proof-broadcast: gated messages go only to peers that asked.
+        if let Some(group) = self
+            .gated
+            .get(&message.topic)
+            .and_then(|gated| gated.group(&message.data))
+        {
+            self.send_gated(&group, msg_id, &message, propagation_source, &originating_peers);
+            return true;
+        }
+
         let mut recipient_peers = HashSet::new();
 
         // Populate the recipient peers mapping
@@ -3475,6 +3595,11 @@ where
             // Forget px and outbound status for this peer
             self.px_peers.remove(&peer_id);
 
+            // proof-broadcast: forget its WANTs on gated topics.
+            for gated in self.gated.values_mut() {
+                gated.remove_peer(&peer_id);
+            }
+
             // If metrics are enabled, register the disconnection of a peer based on its protocol.
             #[cfg(feature = "metrics")]
             if let Some(metrics) = self.metrics.as_mut() {
@@ -3820,6 +3945,9 @@ where
                             if let Some(extensions) = extensions {
                                 self.handle_extensions(&propagation_source, extensions);
                             }
+                        }
+                        ControlAction::WantGroup(WantGroup { topic_hash, groups }) => {
+                            self.handle_want_group(&propagation_source, topic_hash, groups);
                         }
                     }
                 }

@@ -40,6 +40,15 @@ message ControlMessage {
 	repeated ControlPrune prune = 4;
 	repeated ControlIDontWant idontwant = 5;
 	optional ControlExtensions extensions = 6;
+	// proof-broadcast: pull-gated topics (see Behaviour::gate_topic).
+	repeated ControlWantGroup wantgroup = 100;
+}
+
+// proof-broadcast: ask the receiver to send us the messages of these groups
+// on a pull-gated topic, those it holds now and those it forwards later.
+message ControlWantGroup {
+	optional string topic_id = 1;
+	repeated bytes group_ids = 2;
 }
 
 message ControlIHave {

@@ -48,7 +48,7 @@ BIN_DOCKER = f"/opt/proofsim/{BIN_NAME}"
 BIN_NATIVE = str(REPO_ROOT / "target" / "release" / BIN_NAME)
 STDOUT_NAME = f"{BIN_NAME}.1000.stdout"
 
-MODES = {"gossipsub", "partial", "gossipsub-chunked"}
+MODES = {"gossipsub", "partial", "gossipsub-chunked", "gossipsub-chunked-pull"}
 DEFAULT_MODE = "gossipsub"
 # Keep in sync with the clap defaults in src/node.rs.
 DEFAULT_SUBNETS = 16

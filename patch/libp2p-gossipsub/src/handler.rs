@@ -93,25 +93,31 @@ const MAX_SUBSTREAM_ATTEMPTS: usize = 5;
 // prover u16 || committees u64 || ..` (all LE). `subnet=65535` marks an L2's
 // intermediate aggregate, `mask=` is its committee bitmask. Partials also
 // report `body=` (chunk bytes; 0 = metadata-only announcement). On
-// `/proofs_chunked/1` each message is one bincode `ChunkMessage { subnet,
-// prover, committees, index: u16, .. }`, tagged with `index=` too.
+// `/proofs_chunked/1` and `/proofs_chunked_pull/1` each message is one bincode
+// `ChunkMessage { subnet, prover, committees, index: u16, .. }`, tagged with
+// `index=` too; `/proofs_headers/1` carries `HeaderMessage { subnet, prover,
+// committees, .. }`. WANT control messages (pull-gated topics) are traced as
+// `want=1` with the proof of the group they ask for.
 const PROOFS_TOPIC: &str = "/proofs/1";
+const PROOFS_HEADERS_TOPIC: &str = "/proofs_headers/1";
 const PROOFS_CHUNKED_TOPIC: &str = "/proofs_chunked/1";
+const PROOFS_CHUNKED_PULL_TOPIC: &str = "/proofs_chunked_pull/1";
+
+fn proof_fields(b: &[u8]) -> String {
+    format!(
+        " subnet={} prover={} mask={}",
+        u16::from_le_bytes([b[0], b[1]]),
+        u16::from_le_bytes([b[2], b[3]]),
+        u64::from_le_bytes(b[4..12].try_into().expect("8 bytes"))
+    )
+}
 
 fn proof_tag(topic: &str, head: &[u8]) -> String {
-    let fields = |b: &[u8]| {
-        format!(
-            " subnet={} prover={} mask={}",
-            u16::from_le_bytes([b[0], b[1]]),
-            u16::from_le_bytes([b[2], b[3]]),
-            u64::from_le_bytes(b[4..12].try_into().expect("8 bytes"))
-        )
-    };
     match topic {
-        PROOFS_TOPIC => head.get(..12).map(fields).unwrap_or_default(),
-        PROOFS_CHUNKED_TOPIC => head
+        PROOFS_TOPIC | PROOFS_HEADERS_TOPIC => head.get(..12).map(proof_fields).unwrap_or_default(),
+        PROOFS_CHUNKED_TOPIC | PROOFS_CHUNKED_PULL_TOPIC => head
             .get(..14)
-            .map(|b| format!("{} index={}", fields(b), u16::from_le_bytes([b[12], b[13]])))
+            .map(|b| format!("{} index={}", proof_fields(b), u16::from_le_bytes([b[12], b[13]])))
             .unwrap_or_default(),
         _ => String::new(),
     }
@@ -121,14 +127,34 @@ fn group_tag(topic: &str, group_id: &[u8]) -> String {
     proof_tag(topic, group_id.get(1..).unwrap_or_default())
 }
 
+/// One `wire_*` line per group a WANT asks for. The id hashes the topic and
+/// group, so a send and its receive match.
+fn trace_want(direction: &str, now_us: u128, peer: PeerId, topic: &str, groups: &[Vec<u8>]) {
+    for group in groups {
+        let mut hash = Sha256::new();
+        hash.update(b"want");
+        hash.update(topic.as_bytes());
+        hash.update(group);
+        let tag = group.get(1..13).map(proof_fields).unwrap_or_default();
+        tracing::info!(target: "event", "EVENT kind={} t_ms={} t_us={} peer={} id={:x} topic={} bytes={} want=1{}",
+            direction, now_us / 1000, now_us, peer, hash.finalize(), topic,
+            topic.len() + group.len(), tag);
+    }
+}
+
 fn trace_wire(rpc: &proto::Rpc, peer: PeerId) {
-    if rpc.publish.is_empty() && rpc.partial.is_none() {
+    let wants = rpc.control.as_ref().map_or(&[][..], |c| c.wantgroup.as_slice());
+    if rpc.publish.is_empty() && rpc.partial.is_none() && wants.is_empty() {
         return;
     }
     let now_us = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_micros();
+    for want in wants {
+        trace_want("wire_send", now_us, peer, want.topic_id.as_deref().unwrap_or_default(),
+            &want.group_ids);
+    }
     for message in &rpc.publish {
         let data = message.data.as_deref().unwrap_or_default();
         let mut hash = Sha256::new();
@@ -155,14 +181,25 @@ fn trace_wire(rpc: &proto::Rpc, peer: PeerId) {
 }
 
 fn trace_received(rpc: &RpcIn, peer: PeerId) {
+    let has_want = rpc
+        .control_msgs
+        .iter()
+        .any(|c| matches!(c, crate::types::ControlAction::WantGroup(_)));
     #[cfg(feature = "partial-messages")]
-    if rpc.messages.is_empty() && rpc.partial_message.is_none() {
+    if rpc.messages.is_empty() && rpc.partial_message.is_none() && !has_want {
         return;
     }
     let now_us = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_micros();
+    if has_want {
+        for control in &rpc.control_msgs {
+            if let crate::types::ControlAction::WantGroup(want) = control {
+                trace_want("wire_recv", now_us, peer, want.topic_hash.as_str(), &want.groups);
+            }
+        }
+    }
     // Invalid data never enters the application and must not look like a
     // successful payload delivery in the trace.
     for message in &rpc.messages {

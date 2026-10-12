@@ -40,6 +40,7 @@ use crate::{
     topic::TopicHash,
     types::{
         ControlAction, Extensions, Graft, IDontWant, IHave, IWant, MessageId, PeerInfo, PeerKind,
+        WantGroup,
         Prune, RawMessage, RpcIn, Subscription, SubscriptionAction, SubscriptionOpts,
     },
 };
@@ -651,6 +652,14 @@ impl Decoder for GossipsubCodec {
         }
         control_msgs.extend(idontwant_messages);
 
+        // proof-broadcast: pull-gated topics.
+        control_msgs.extend(control.wantgroup.into_iter().map(|want| {
+            ControlAction::WantGroup(WantGroup {
+                topic_hash: TopicHash::from_raw(want.topic_id.unwrap_or_default()),
+                groups: want.group_ids,
+            })
+        }));
+
         let extensions_msg = control.extensions.map(|extensions| Extensions {
             partial_messages: extensions.partial_messages,
         });
@@ -872,6 +881,49 @@ mod tests {
         let result = codec.decode(&mut buf);
         let err = result.unwrap_err().source().unwrap().to_string();
         assert_eq!(err, "rpc control size exceeds max control message size");
+    }
+
+    #[test]
+    fn want_group_round_trips() {
+        let mut codec = GossipsubCodec::new(
+            u32::MAX as usize,
+            ValidationMode::Anonymous,
+            HashMap::new(),
+            500,
+            5120,
+        );
+        let rpc = proto::Rpc {
+            control: Some(proto::ControlMessage {
+                wantgroup: vec![proto::ControlWantGroup {
+                    topic_id: Some("pull".to_string()),
+                    group_ids: vec![vec![1, 2], vec![3]],
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = BytesMut::new();
+        codec.encode(rpc, &mut buf).unwrap();
+        match codec.decode(&mut buf).unwrap().expect("one RPC") {
+            HandlerEvent::Message { rpc, .. } => {
+                let wants: Vec<_> = rpc
+                    .control_msgs
+                    .into_iter()
+                    .filter_map(|c| match c {
+                        ControlAction::WantGroup(want) => Some(want),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(
+                    wants,
+                    vec![WantGroup {
+                        topic_hash: TopicHash::from_raw("pull"),
+                        groups: vec![vec![1, 2], vec![3]],
+                    }]
+                );
+            }
+            _ => panic!("expected a message event"),
+        }
     }
 
     #[test]

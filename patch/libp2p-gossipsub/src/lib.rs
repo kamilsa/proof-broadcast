@@ -99,6 +99,7 @@ mod behaviour;
 mod config;
 mod error;
 pub mod extensions;
+mod gated;
 mod gossip_promises;
 mod handler;
 mod mcache;
@@ -124,6 +125,7 @@ pub use self::{
     behaviour::{Behaviour, Event, MessageAuthenticity},
     config::{Config, ConfigBuilder, ValidationMode, Version},
     error::{ConfigBuilderError, PublishError, SubscriptionError, ValidationError},
+    gated::GroupFn,
     peer_score::{
         PeerScoreParams, PeerScoreThresholds, TopicScoreParams, score_parameter_decay,
         score_parameter_decay_with_base,

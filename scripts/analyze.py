@@ -86,7 +86,8 @@ RUN_END_COUNTERS = ("redundant_proofs", "duplicate_chunks", "declined",
                     "intermediates_published", "intermediates_fetched",
                     "intermediates_declined", "merges_run", "merges_discarded",
                     "items_dropped", "chunks_received", "chunks_ignored", "proofs_unused",
-                    "used_unrelayed", "idontwant_sent")
+                    "used_unrelayed", "idontwant_sent", "wants_sent", "chunks_unwanted")
+CHUNK_MODES = ("gossipsub-chunked", "gossipsub-chunked-pull")
 
 
 def collect_run(run_dir: Path) -> dict:
@@ -203,7 +204,10 @@ def collect_run(run_dir: Path) -> dict:
         "merges_discarded_total": sum(counter("merges_discarded")),
         "items_dropped_total": sum(counter("items_dropped")),
         # gossipsub-chunked: per-chunk relay decisions.
-        "chunked": meta.get("mode") == "gossipsub-chunked",
+        "chunked": meta.get("mode") in CHUNK_MODES,
+        "pull": meta.get("mode") == "gossipsub-chunked-pull",
+        "wants_sent_median": _med(counter("wants_sent")),
+        "chunks_unwanted_total": sum(counter("chunks_unwanted")),
         "chunks_received_median": _med(counter("chunks_received")),
         "chunks_ignored_median": _med(counter("chunks_ignored")),
         "proofs_unused_median": _med(counter("proofs_unused")),
@@ -243,7 +247,11 @@ def print_summary(run: dict) -> None:
     print(f"   per L2 (median): redundant proofs {run['redundant_proofs_median']}, "
           f"duplicate chunks {run['duplicate_chunks_median']}, "
           f"declined {run['declined_median']};  distinct proofs used per subnet: {pps}")
-    if run.get("chunked"):
+    if run.get("pull"):
+        print(f"   chunks/L2 (median): received {run['chunks_received_median']} "
+              f"for {run['wants_sent_median']} proofs asked for (WANT);  "
+              f"unrequested chunks (all L2s): {run['chunks_unwanted_total']}")
+    elif run.get("chunked"):
         print(f"   chunks/L2 (median): received {run['chunks_received_median']}, "
               f"of unrelayed proofs {run['chunks_ignored_median']};  "
               f"assembled but unused proofs/L2 {run['proofs_unused_median']};  "
@@ -411,7 +419,9 @@ over subnets × proof size. With intermediate proofs ("+int"), L2s also publish
 their partial aggregates; "aggs fetched/L2" is how many each L2 used instead of
 recursing itself, and "merges/L2" the 2→1 recursions it ran (subnets − 1 without).
 In gossipsub-chunked mode an L2 relays only the first proof it sees per subnet but
-receives the chunks of every other one; "unrelayed chunks/L2" counts those.</p>
+receives the chunks of every other one; "unrelayed chunks/L2" counts those. In
+gossipsub-chunked-pull mode proofs are announced by header and an L2 asks only for
+the one it chooses, so it never receives chunks of the others (0).</p>
 <div class="wrap"><table><thead><tr>{head}</tr></thead><tbody>{"".join(rows)}</tbody></table></div>
 <div class="charts">
 <div>{svg_cdf(series_agg, "L2 aggregate complete (CDF)")}</div>

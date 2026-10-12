@@ -71,7 +71,7 @@ impl Queue {
                     .expect("Shared is unbounded");
                 Ok(())
             }
-            RpcOut::Graft(_) | RpcOut::Prune(_) | RpcOut::IDontWant(_) => {
+            RpcOut::Graft(_) | RpcOut::Prune(_) | RpcOut::IDontWant(_) | RpcOut::WantGroup(_) => {
                 self.control.try_push(message)
             }
             RpcOut::Publish { .. }

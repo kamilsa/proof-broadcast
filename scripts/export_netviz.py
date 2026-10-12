@@ -25,6 +25,9 @@ carry `mask` so the viewer can tell them apart.
 `gossipsub-chunked` messages (topic `/proofs_chunked/1`, tagged `index=`)
 are `chunk` if it is the receiver's first copy of that chunk and the receiver
 used that proof (it completed first for its committees), else `wasted`.
+`gossipsub-chunked-pull` chunks (`/proofs_chunked_pull/1`) are classified the
+same way; its headers (`/proofs_headers/1`) and WANTs (`want=1`) are
+`announce`.
 
 Usage:
   python3 scripts/export_netviz.py shadow-output [destination.ndjson]
@@ -51,6 +54,7 @@ APP_KINDS = {
 }
 DEFAULT_NAME = "proof-broadcast.netviz.ndjson"
 AGGREGATE_SUBNET = 65535  # proof::AGGREGATE_SUBNET
+HEADERS_TOPIC = "/proofs_headers/1"  # gossipsub-chunked-pull announcements
 
 
 def proof_key(ev: dict) -> tuple[int, int, int]:
@@ -198,7 +202,9 @@ def export(run: Path, output: Path) -> dict[str, int]:
         sent = queue.popleft()
         subnet, prover, mask = proof_key(ev)
         key = (ev["node"], str(ev["peer"]), subnet, prover, mask)
-        if "index" in ev:
+        if ev.get("want") or ev.get("topic") == HEADERS_TOPIC:
+            layer = "announce"
+        elif "index" in ev:
             copy = (ev["node"], subnet, prover, mask, int(ev["index"]))
             first = copy not in seen_chunks
             seen_chunks.add(copy)

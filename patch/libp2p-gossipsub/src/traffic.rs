@@ -76,11 +76,13 @@ pub enum ControlKind {
     Subscription,
     /// The gossipsub extension handshake. Never carries a topic.
     Extensions,
+    /// proof-broadcast: WANT for groups on a pull-gated topic.
+    WantGroup,
 }
 
 impl ControlKind {
     /// Number of distinct control kinds; the width of the per-kind arrays.
-    pub const COUNT: usize = 7;
+    pub const COUNT: usize = 8;
 
     /// Dense index of this kind, used to address the per-kind arrays.
     pub const fn index(self) -> usize {
@@ -92,6 +94,7 @@ impl ControlKind {
             ControlKind::IDontWant => 4,
             ControlKind::Subscription => 5,
             ControlKind::Extensions => 6,
+            ControlKind::WantGroup => 7,
         }
     }
 
@@ -104,6 +107,7 @@ impl ControlKind {
         ControlKind::IDontWant,
         ControlKind::Subscription,
         ControlKind::Extensions,
+        ControlKind::WantGroup,
     ];
 
     /// Lowercase name, for log/metric labels.
@@ -116,6 +120,7 @@ impl ControlKind {
             ControlKind::IDontWant => "idontwant",
             ControlKind::Subscription => "subscription",
             ControlKind::Extensions => "extensions",
+            ControlKind::WantGroup => "wantgroup",
         }
     }
 }
@@ -407,6 +412,7 @@ fn clone_control(rpc: &RpcOut) -> Option<RpcOut> {
         RpcOut::IHave(ihave) => RpcOut::IHave(ihave.clone()),
         RpcOut::IWant(iwant) => RpcOut::IWant(iwant.clone()),
         RpcOut::IDontWant(idontwant) => RpcOut::IDontWant(idontwant.clone()),
+        RpcOut::WantGroup(want) => RpcOut::WantGroup(want.clone()),
         RpcOut::Extensions(extensions) => RpcOut::Extensions(*extensions),
         RpcOut::TestExtension => RpcOut::TestExtension,
         RpcOut::Publish { .. } => return None,
@@ -491,6 +497,11 @@ pub(crate) fn classify_outbound(rpc: &RpcOut, attribution: Attribution<'_>) -> C
             &idontwant.message_ids,
             attribution,
         ),
+        RpcOut::WantGroup(want) => Contribution::Control {
+            topic: Some(want.topic_hash.clone()),
+            kind: ControlKind::WantGroup,
+            bytes: control_encoded_len(rpc),
+        },
         RpcOut::Extensions(_) | RpcOut::TestExtension => Contribution::Control {
             topic: None,
             kind: ControlKind::Extensions,
@@ -648,6 +659,16 @@ pub(crate) fn account_inbound_control(
                 &idontwant.message_ids,
                 resolve,
             );
+        }
+        ControlAction::WantGroup(want) => {
+            let bytes = proto::ControlWantGroup {
+                topic_id: Some(want.topic_hash.clone().into_string()),
+                group_ids: want.groups.clone(),
+            }
+            .encoded_len();
+            stats
+                .rx_mut(&want.topic_hash)
+                .add_control(ControlKind::WantGroup, len_delimited_field_len(bytes));
         }
         ControlAction::Extensions(extensions) => {
             // The extension handshake is a handful of bytes and has no topic.

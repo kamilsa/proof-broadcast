@@ -61,6 +61,18 @@ pub struct ControlMessage {
     pub idontwant: ::prost::alloc::vec::Vec<ControlIDontWant>,
     #[prost(message, optional, tag = "6")]
     pub extensions: ::core::option::Option<ControlExtensions>,
+    /// proof-broadcast: pull-gated topics (see Behaviour::gate_topic).
+    #[prost(message, repeated, tag = "100")]
+    pub wantgroup: ::prost::alloc::vec::Vec<ControlWantGroup>,
+}
+/// proof-broadcast: ask the receiver to send us the messages of these groups
+/// on a pull-gated topic, those it holds now and those it forwards later.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ControlWantGroup {
+    #[prost(string, optional, tag = "1")]
+    pub topic_id: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(bytes = "vec", repeated, tag = "2")]
+    pub group_ids: ::prost::alloc::vec::Vec<::prost::alloc::vec::Vec<u8>>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ControlIHave {

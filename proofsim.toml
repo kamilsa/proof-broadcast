@@ -10,7 +10,7 @@
 runner = "docker"
 
 [sim]
-mode = "gossipsub"            # gossipsub | partial | gossipsub-chunked
+mode = "gossipsub"            # gossipsub | partial | gossipsub-chunked | gossipsub-chunked-pull
 title = "gossipsub-300kib"    # label shown in summary.html
 seed = 42                     # master RNG seed (topology, keypairs, proofs, publish delays)
 runs = 1                      # number of runs; run i uses seed+i
@@ -20,7 +20,7 @@ provers_per_subnet = 4        # L1 provers per subnet (each publishes a distinct
 l2_provers = 64
 
 proof_size_kib = 300
-chunk_count = 64              # partial / gossipsub-chunked: chunks per proof
+chunk_count = 64              # partial / gossipsub-chunked(-pull): chunks per proof
 # gossipsub-chunked: after each new chunk also send IDONTWANT to every mesh
 # peer (as ec-sim). Gossipsub already sends IDONTWANT on receipt for messages
 # above 1000 bytes, so this only adds explicit, post-validation ones.

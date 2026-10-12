@@ -186,6 +186,47 @@ async fn gossipsub_chunked_mode_with_intermediate_proofs() {
     check_chunked("gossipsub-chunked+intermediate", 4, &l2);
 }
 
+/// Pull mode: an L2 receives chunks only of the proofs it chose, exactly once.
+fn check_pull(label: &str, l2: &[NodeReport]) {
+    for (i, r) in l2.iter().enumerate() {
+        eprintln!(
+            "{label} L2 {i}: chunks={} unwanted={} wants={} declined={} agg_declined={}",
+            r.chunks_received, r.chunks_unwanted, r.wants_sent, r.declined, r.intermediates_declined
+        );
+        assert_eq!(r.chunks_unwanted, 0, "{label}: L2 {i} got unrequested chunks: {r:?}");
+        assert_eq!(r.chunks_ignored, 0);
+        assert_eq!(r.proofs_unused, 0);
+        assert_eq!(
+            r.chunks_received,
+            r.wants_sent * 16,
+            "{label}: L2 {i} got every chunk of each proof it asked for, and nothing else"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn gossipsub_chunked_pull_mode_delivers_one_proof_per_subnet() {
+    let (l1, l2) = run_network(Mode::GossipsubChunkedPull, 2, &[]).await;
+    check("gossipsub-chunked-pull", 2, &l1, &l2);
+    check_plain(Mode::GossipsubChunkedPull, &l2);
+    check_pull("gossipsub-chunked-pull", &l2);
+    for r in &l2 {
+        // One proof per subnet asked for; the competing prover's header only.
+        assert_eq!(r.wants_sent, 2);
+    }
+    for r in &l1 {
+        assert_eq!(r.subnets_done, 0);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn gossipsub_chunked_pull_mode_with_intermediate_proofs() {
+    let (l1, l2) = run_network(Mode::GossipsubChunkedPull, 4, &["--intermediate-proofs"]).await;
+    check("gossipsub-chunked-pull+intermediate", 4, &l1, &l2);
+    check_intermediates("gossipsub-chunked-pull+intermediate", &l2);
+    check_pull("gossipsub-chunked-pull+intermediate", &l2);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn gossipsub_mode_with_intermediate_proofs() {
     let (l1, l2) = run_network(Mode::Gossipsub, 4, &["--intermediate-proofs"]).await;
@@ -311,6 +352,26 @@ async fn gossipsub_late_l2_fetches_intermediate_aggregate() {
 async fn gossipsub_chunked_late_l2_fetches_intermediate_aggregate() {
     let (late, l2) = run_late_joiner(Mode::GossipsubChunked, MISSED_BOTH, 4300, &[]).await;
     check_late_joiner("gossipsub-chunked", &late, &l2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn gossipsub_chunked_pull_late_l2_fetches_intermediate_aggregate() {
+    let (late, l2) = run_late_joiner(Mode::GossipsubChunkedPull, MISSED_BOTH, 4300, &[]).await;
+    check_late_joiner("gossipsub-chunked-pull", &late, &l2);
+    assert_eq!(late.chunks_unwanted, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn gossipsub_chunked_pull_late_l2_subsumes_held_proof() {
+    let (late, l2) = run_late_joiner(
+        Mode::GossipsubChunkedPull,
+        [0, 2000, 6000, 6000],
+        4300,
+        &["--intermediate-fetch=subsume"],
+    )
+    .await;
+    check_late_joiner("gossipsub-chunked-pull+subsume", &late, &l2);
+    assert_eq!(late.items_dropped, 1, "the held {{1}} was replaced by {{0,1}}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -1,4 +1,7 @@
 /target
+# Build output of running the patched gossipsub's own tests
+patch/libp2p-gossipsub/target/
+patch/libp2p-gossipsub/Cargo.lock
 
 # Shadow runs and Python
 shadow-output/
