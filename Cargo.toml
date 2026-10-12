@@ -1,0 +1,45 @@
+[package]
+name = "proof-broadcast"
+version = "0.1.0"
+edition = "2024"
+description = "Shadow-compatible leanVM proof-propagation simulator"
+
+[lib]
+name = "proof_broadcast"
+path = "src/lib.rs"
+
+[[bin]]
+name = "proof-broadcast"
+path = "src/main.rs"
+
+# libp2p comes from the same kamilsa/rust-libp2p fork ec-sim and blobsim use
+# (gossipsub partial messages + per-topic `traffic()` byte counters).
+[dependencies]
+libp2p = { git = "https://github.com/kamilsa/rust-libp2p", rev = "2473afce1b3e05393f86aabdcdf57aa4ab1d6c2e", features = [
+    "gossipsub",
+    "gossipsub-partial-messages",
+    "quic",
+    "dns",
+    "tokio",
+    "macros",
+] }
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+bincode = "1"
+rand = "0.10"
+futures = "0.3"
+sha2 = "0.10"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
+
+# Shadow-compatible UDP (see ec-sim).
+[patch.crates-io]
+quinn-udp = { path = "patch/quinn-udp" }
+
+# Partial-message TTL fix, traffic counters and wire tracing (see ec-sim).
+[patch."https://github.com/kamilsa/rust-libp2p"]
+libp2p-gossipsub = { path = "patch/libp2p-gossipsub" }

@@ -1,0 +1,8 @@
+/target
+
+# Shadow runs and Python
+shadow-output/
+shadow-output-*/
+.venv/
+__pycache__/
+*.pyc

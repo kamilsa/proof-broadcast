@@ -1,0 +1,9 @@
+[project]
+name = "proof-broadcast"
+version = "0.1.0"
+description = "Shadow launcher + analyzer for the leanVM proof-propagation simulator"
+requires-python = ">=3.11"
+dependencies = []
+
+[tool.uv]
+package = false

@@ -1,0 +1,84 @@
+# proofsim.toml — configuration for `uv run shadow-sim.py`.
+#
+# 16 subnets x 4 L1 provers publish one leanVM proof each; 64 L2 provers each
+# collect one proof per subnet and aggregate them with 2->1 recursion.
+
+[run]
+# "docker" builds an image (proof-broadcast on top of [docker].shadow_image) and
+#          runs Shadow in a container — zero local setup beyond Docker.
+# "native" builds with `cargo build --release` and runs `shadow` from PATH (Linux).
+runner = "docker"
+
+[sim]
+mode = "gossipsub"            # gossipsub | partial
+title = "gossipsub-300kib"    # label shown in summary.html
+seed = 42                     # master RNG seed (topology, keypairs, proofs, publish delays)
+runs = 1                      # number of runs; run i uses seed+i
+
+subnets = 16
+provers_per_subnet = 4        # L1 provers per subnet (each publishes a distinct proof)
+l2_provers = 64
+
+proof_size_kib = 300
+chunk_count = 64              # partial: chunks per proof
+proof_jitter_ms = 500         # each L1 publishes at epoch + uniform[0, jitter] (seeded)
+publish_grace_secs = 10       # an L1 publishes at most this late while waiting for peers
+
+# 2->1 recursion cost from leanVM's README (0.287 s, M4 Max, log-inv-rate 2).
+# Each L2 merges pairs as proofs arrive, `aggregation_workers` merges at a time.
+aggregation_ms = 290
+aggregation_workers = 1
+
+warmup_secs = 15              # connect + form meshes; the publish epoch follows
+observe_secs = 20             # every node exits at epoch + observe_secs
+
+# Gossipsub. libp2p defaults flood_publish to true; Ethereum clients set false.
+flood_publish = false
+gossip_lazy = 0
+gossip_factor = 0.0
+
+# /proofs/1 mesh (L2 provers only). L1 provers publish to `proofs_mesh_n`
+# fanout peers. Must satisfy outbound_min <= n_low <= n <= n_high and
+# 2 * outbound_min <= n.
+proofs_mesh_n_low = 6
+proofs_mesh_n = 8
+proofs_mesh_n_high = 12
+proofs_mesh_outbound_min = 3
+
+rust_log = "info"
+# stop_time = "90s"           # optional; default = warmup_secs + observe_secs + 30s
+
+[topology]
+# Every node dials only L2 provers (L1 provers never subscribe, so L1<->L1
+# links would carry nothing).
+l1_peers_per_node = 16
+l2_peers_per_node = 32
+
+[network]
+jitter_ratio = 0.3
+packet_loss = 0.0
+
+[network.l1]                  # EIP-7870 home staker
+bandwidth_up = "25 Mbit"
+bandwidth_down = "50 Mbit"
+
+[network.l2]
+bandwidth_up = "25 Mbit"
+bandwidth_down = "50 Mbit"
+
+[network.regions]             # region -> weight (probability a host lands there)
+us-east = 0.30
+us-west = 0.15
+europe  = 0.25
+asia    = 0.20
+sa      = 0.05
+africa  = 0.05
+
+[docker]
+# Base image that ships Shadow (arm64); :tcpfix carries the tcp send-cap fix.
+shadow_image = "kamilsa/shadow-arm:tcpfix"
+image_name = "proofsim-shadow:local"
+rebuild = false
+
+[output]
+dir = "shadow-output"

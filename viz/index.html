@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Proof Broadcast Viz</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Ubuntu+Sans+Mono:wght@400..700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/src/style.css">
+</head>
+<body>
+<div id="app">
+  <header id="toolbar">
+    <span class="brand">Proof broadcast</span>
+    <label id="file-label" class="btn">Load trace<input type="file" id="file-input" accept=".ndjson,.json,.txt"></label>
+    <select id="trace-select" class="select" hidden aria-label="Traces found in shadow-output directories"></select>
+    <span id="run-title"></span>
+    <span id="run-meta"></span>
+    <span class="spacer"></span>
+    <span class="tb-label">Particles</span>
+    <div class="seg" id="color-mode" role="group" aria-label="Particle colour">
+      <button data-v="subnet" class="active">Subnet</button><button data-v="outcome">Outcome</button>
+    </div>
+    <label class="tgl"><input type="checkbox" id="tgl-announce"><span>Announce</span></label>
+    <label class="tgl"><input type="checkbox" id="tgl-edges"><span>Links</span></label>
+    <span class="tb-label">Aggregators</span>
+    <select id="order-select" class="select" aria-label="L2 placement">
+      <option value="finish">by finish time</option>
+      <option value="region">by region</option>
+      <option value="name">by name</option>
+    </select>
+  </header>
+  <main id="main">
+    <aside id="left" class="panel">
+      <h2>Overview</h2>
+      <div id="overview"></div>
+      <h2>Subnets <span class="h-note">provers · L2s holding</span></h2>
+      <div id="subnet-list"></div>
+      <h2>Completion</h2>
+      <div class="chart-box"><canvas id="completion"></canvas></div>
+      <div class="chart-legend"><i class="dot all"></i>all subnets <i class="dot agg"></i>aggregated</div>
+    </aside>
+    <section id="stage">
+      <canvas id="net"></canvas>
+      <button id="legend-btn" aria-expanded="false" aria-controls="legend">Legend</button>
+      <div id="legend" hidden>
+        <div class="lg-title">Aggregator (L2)</div>
+        <div class="lg-row"><svg viewBox="-12 -12 24 24" width="26" height="26" id="lg-donut"></svg><span>segment per subnet, filled as its proof arrives; points at the subnet</span></div>
+        <div class="lg-row"><i class="dot" style="background:var(--collecting)"></i>core: collecting</div>
+        <div class="lg-row"><i class="dot" style="background:var(--all)"></i>core: all subnets held</div>
+        <div class="lg-row"><i class="dot" style="background:var(--aggregated)"></i>core: aggregated</div>
+        <div class="lg-row"><i class="dot ring"></i>pulsing ring: 2→1 recursion running; gold wedge: merges done</div>
+        <div class="lg-title">L1 prover</div>
+        <div class="lg-row"><span>ring = share of L2s that chose its proof</span></div>
+        <div class="lg-title" id="lg-particles-title">Particles</div>
+        <div id="lg-particles"></div>
+      </div>
+      <div id="tooltip" hidden></div>
+      <div id="empty">
+        <p>Drop a <code>proof-broadcast.netviz.ndjson</code> trace here, or use <b>Load trace</b>.</p>
+        <p class="small">Export one with <code>uv run shadow-sim.py --netviz-trace</code>.</p>
+      </div>
+      <div id="timeline">
+        <button id="btn-reset" class="icon" title="Back to start (Home)" aria-label="Back to start">⏮</button>
+        <button id="btn-play" class="icon" title="Play / pause (Space)" aria-label="Play">▶</button>
+        <div class="tl-track">
+          <input type="range" id="scrub" min="0" max="1" step="1000" value="0" aria-label="Time">
+          <div id="ticks"></div>
+        </div>
+        <span id="time">0.000 s</span>
+        <select id="speed" class="select" aria-label="Playback speed">
+          <option value="0.05">0.05×</option>
+          <option value="0.1">0.1×</option>
+          <option value="0.25" selected>0.25×</option>
+          <option value="0.5">0.5×</option>
+          <option value="1">1×</option>
+          <option value="2">2×</option>
+        </select>
+      </div>
+    </section>
+    <aside id="right" class="panel">
+      <nav id="right-tabs">
+        <button data-tab="matrix" class="active">Aggregators</button>
+        <button data-tab="detail">Detail</button>
+        <button data-tab="log">Log</button>
+      </nav>
+      <div id="tab-matrix" class="tab"><canvas id="matrix"></canvas></div>
+      <div id="tab-detail" class="tab" hidden></div>
+      <div id="tab-log" class="tab" hidden>
+        <div id="log-filter"></div>
+        <div id="log-list"></div>
+      </div>
+    </aside>
+  </main>
+</div>
+<script type="module" src="/src/main.ts"></script>
+</body>
+</html>
