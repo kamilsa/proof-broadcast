@@ -88,17 +88,20 @@ const MAX_SUBSTREAM_ATTEMPTS: usize = 5;
 // two different partials of one group cannot be confused.
 //
 // proof-broadcast: tag `/proofs/1` traffic with the proof it carries. A whole
-// proof message is bincode `ProofMessage { subnet: u16, prover: u16, .. }`; a
-// partial's group id is `0x02 || subnet u16 || prover u16 || ..` (all LE).
-// Partials also report `body=` (chunk bytes; 0 = metadata-only announcement).
+// proof message is bincode `ProofMessage { subnet: u16, prover: u16,
+// committees: u64, .. }`; a partial's group id is `0x03 || subnet u16 ||
+// prover u16 || committees u64 || ..` (all LE). `subnet=65535` marks an L2's
+// intermediate aggregate, `mask=` is its committee bitmask. Partials also
+// report `body=` (chunk bytes; 0 = metadata-only announcement).
 const PROOFS_TOPIC: &str = "/proofs/1";
 
 fn proof_tag(topic: &str, head: &[u8]) -> String {
-    match head.get(..4) {
+    match head.get(..12) {
         Some(b) if topic == PROOFS_TOPIC => format!(
-            " subnet={} prover={}",
+            " subnet={} prover={} mask={}",
             u16::from_le_bytes([b[0], b[1]]),
-            u16::from_le_bytes([b[2], b[3]])
+            u16::from_le_bytes([b[2], b[3]]),
+            u64::from_le_bytes(b[4..12].try_into().expect("8 bytes"))
         ),
         _ => String::new(),
     }

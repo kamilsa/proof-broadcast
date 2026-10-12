@@ -3,7 +3,8 @@
 //! L1 provers (one per `(subnet, prover)`) each publish a proof; L2 provers
 //! collect one proof per subnet and aggregate them with 2→1 recursion. Two
 //! transports are compared: whole proofs over gossipsub, and chunked proofs
-//! over gossipsub 1.3 partial messages.
+//! over gossipsub 1.3 partial messages. Optionally, L2 provers also publish
+//! their intermediate aggregates for other L2s to fetch.
 
 pub mod aggregation;
 pub mod events;

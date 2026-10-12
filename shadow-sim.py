@@ -57,10 +57,15 @@ DEFAULT_L2_PROVERS = 64
 DEFAULT_PROOF_SIZE_KIB = 300
 DEFAULT_CHUNK_COUNT = 64
 MAX_CHUNKS = 4096  # proof::MAX_CHUNKS
+MAX_SUBNETS = 64  # proof::MAX_SUBNETS (committees fit a u64 mask)
 DEFAULT_PROOF_JITTER_MS = 500
 DEFAULT_PUBLISH_GRACE_SECS = 10
 DEFAULT_AGGREGATION_MS = 290  # leanVM README: 2->1 recursion 0.287 s (M4 Max)
 DEFAULT_AGGREGATION_WORKERS = 1
+DEFAULT_INTERMEDIATE_PROOFS = False
+DEFAULT_INTERMEDIATE_MIN_COMMITTEES = 2
+FETCH_POLICIES = {"disjoint", "subsume"}
+DEFAULT_INTERMEDIATE_FETCH = "disjoint"
 DEFAULT_WARMUP_SECS = 15
 DEFAULT_OBSERVE_SECS = 20
 DEFAULT_FLOOD_PUBLISH = False
@@ -149,8 +154,8 @@ def gossip_tuning_settings(sim: dict) -> tuple[bool, int, float]:
 def prover_settings(sim: dict) -> dict:
     """Validated prover / proof / aggregation parameters, as run metadata."""
     subnets = _positive_int(sim, "subnets", DEFAULT_SUBNETS)
-    if subnets > 65535:
-        die(f"[sim].subnets must be <= 65535, got {subnets}")
+    if subnets > MAX_SUBNETS:
+        die(f"[sim].subnets must be <= {MAX_SUBNETS}, got {subnets}")
     return {
         "subnets": subnets,
         "provers_per_subnet": _positive_int(sim, "provers_per_subnet", DEFAULT_PROVERS_PER_SUBNET),
@@ -162,9 +167,32 @@ def prover_settings(sim: dict) -> dict:
         "aggregation_ms": _nonneg_int(sim, "aggregation_ms", DEFAULT_AGGREGATION_MS),
         "aggregation_workers": _positive_int(sim, "aggregation_workers",
                                              DEFAULT_AGGREGATION_WORKERS),
+        **intermediate_settings(sim),
         "warmup_secs": _nonneg_int(sim, "warmup_secs", DEFAULT_WARMUP_SECS),
         "observe_secs": _nonneg_int(sim, "observe_secs", DEFAULT_OBSERVE_SECS),
     }
+
+
+def intermediate_settings(sim: dict) -> dict:
+    """L2s publishing their intermediate aggregates (never the final one)."""
+    enabled = bool(sim.get("intermediate_proofs", DEFAULT_INTERMEDIATE_PROOFS))
+    min_committees = int(sim.get("intermediate_min_committees",
+                                 DEFAULT_INTERMEDIATE_MIN_COMMITTEES))
+    if min_committees < 2:
+        die(f"[sim].intermediate_min_committees must be >= 2, got {min_committees}")
+    fetch = str(sim.get("intermediate_fetch", DEFAULT_INTERMEDIATE_FETCH))
+    if fetch not in FETCH_POLICIES:
+        die(f"[sim].intermediate_fetch must be one of {sorted(FETCH_POLICIES)}, got {fetch!r}")
+    return {"intermediate_proofs": enabled, "intermediate_min_committees": min_committees,
+            "intermediate_fetch": fetch}
+
+
+def warn_unpublishable(p: dict) -> None:
+    """Only aggregates covering min..subnets-1 committees are ever published."""
+    if p["intermediate_proofs"] and p["intermediate_min_committees"] >= p["subnets"]:
+        log(f"warning: intermediate_proofs is on but no aggregate can be published "
+            f"(intermediate_min_committees={p['intermediate_min_committees']} >= "
+            f"subnets={p['subnets']}; the final aggregate is never published)")
 
 
 def role_bandwidth(net: dict, role: str) -> tuple[str, str]:
@@ -202,7 +230,8 @@ def build_nodes(sim: dict) -> list[Node]:
         subnet, prover = divmod(i, p["provers_per_subnet"])
         nodes.append(Node(i, f"l1-s{subnet:02d}-p{prover}", "l1", subnet, prover))
     for j in range(p["l2_provers"]):
-        nodes.append(Node(l1 + j, f"l2-{j:0{width}d}", "l2"))
+        # An L2's prover index labels the intermediate aggregates it publishes.
+        nodes.append(Node(l1 + j, f"l2-{j:0{width}d}", "l2", prover=j))
     base = ipaddress.ip_address("11.0.0.1")
     for node in nodes:
         node.ip = str(base + node.index)
@@ -324,6 +353,12 @@ def build_args(node: Node, cfg: dict, peers: list[str]) -> str:
     if node.role == "l1":
         parts += ["--subnet", str(node.subnet), "--prover", str(node.prover),
                   "--publish-delay-ms", str(node.publish_delay_ms)]
+    else:
+        parts += ["--prover", str(node.prover)]
+        if p["intermediate_proofs"]:
+            parts += ["--intermediate-proofs",
+                      "--intermediate-min-committees", str(p["intermediate_min_committees"]),
+                      "--intermediate-fetch", p["intermediate_fetch"]]
     flood, lazy, factor = gossip_tuning_settings(sim)
     if flood:
         parts.append("--flood-publish")
@@ -400,7 +435,7 @@ def generate_run(cfg: dict, out_dir: Path, seed: int, bin_path: str,
     gml_path.write_text(generate_gml(nodes, jitter_ratio, packet_loss, geo_rng))
     (out_dir / "nodes.json").write_text(json.dumps({
         node.name: {"role": node.role, "subnet": node.subnet if node.role == "l1" else None,
-                    "prover": node.prover if node.role == "l1" else None,
+                    "prover": node.prover,
                     "publish_delay_ms": node.publish_delay_ms if node.role == "l1" else None,
                     "region": node.region,
                     "up": node.bandwidth_up, "down": node.bandwidth_down}
@@ -484,7 +519,8 @@ def summarize(out_dir: Path) -> None:
     if not hosts_dir.is_dir():
         log(f"no shadow.data/hosts under {out_dir} — nothing to summarize.")
         return
-    counts = {"hosts": 0, "published": 0, "l2": 0, "all_subnets": 0, "aggregated": 0}
+    counts = {"hosts": 0, "published": 0, "l2": 0, "all_subnets": 0, "aggregated": 0,
+              "intermediates": 0, "fetched": 0}
     for host in sorted(hosts_dir.iterdir()):
         stdout = host / STDOUT_NAME
         if not stdout.is_file():
@@ -497,10 +533,15 @@ def summarize(out_dir: Path) -> None:
             counts["l2"] += 1
             counts["all_subnets"] += "EVENT kind=all_subnets_complete" in text
             counts["aggregated"] += "EVENT kind=aggregate_complete" in text
+            counts["intermediates"] += text.count("EVENT kind=intermediate_published")
+            counts["fetched"] += text.count("EVENT kind=intermediate_complete")
     log("── run summary ─────────────────────────────────────────────")
     log(f"hosts: {counts['hosts']}  L1 published: {counts['published']}")
     log(f"L2 collected all subnets: {counts['all_subnets']}/{counts['l2']}  "
         f"aggregated: {counts['aggregated']}/{counts['l2']}")
+    if counts["intermediates"]:
+        log(f"intermediate aggregates published: {counts['intermediates']}  "
+            f"fetched: {counts['fetched']}")
     log("────────────────────────────────────────────────────────────")
 
 
@@ -549,7 +590,7 @@ def main() -> None:
     sim = cfg.setdefault("sim", {})
     sim.setdefault("seed", 42)
     mode_setting(sim)
-    prover_settings(sim)
+    warn_unpublishable(prover_settings(sim))
     mesh_settings(sim)
     gossip_tuning_settings(sim)
 

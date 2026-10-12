@@ -3,8 +3,8 @@
 import type { Model, Transfer } from './model';
 import type { Layout } from './layout';
 import { sectorAngles } from './layout';
-import { UI, proverColor, subnetColor } from './palette';
-import { countUpTo, isMerging, l2Phase, mergesDone, slotState, type L2Phase } from './state';
+import { UI, heldColor, intermediateColor, proverColor, subnetColor } from './palette';
+import { countUpTo, isMerging, l2Phase, mergesDone, mergesNeeded, slotState, type L2Phase } from './state';
 
 export type ColorMode = 'subnet' | 'outcome';
 
@@ -41,8 +41,16 @@ function transferColor(model: Model, tr: Transfer, mode: ColorMode, alpha: numbe
     if (tr.layer === 'wasted') return `oklch(0.70 0.18 35 / ${alpha})`;
     return `oklch(0.80 0.13 175 / ${alpha})`;
   }
-  if (tr.subnet < 0) return `oklch(0.7 0 0 / ${alpha})`;
+  if (tr.subnet < 0) {
+    if (tr.committees.length > 1) return intermediateColor(tr.layer === 'wasted' ? alpha * 0.45 : alpha);
+    return `oklch(0.7 0 0 / ${alpha})`;
+  }
   return subnetColor(tr.subnet, model.subnets, tr.layer === 'wasted' ? alpha * 0.45 : alpha);
+}
+
+/** Whether a transfer carries data of `subnet` (alone or inside an aggregate). */
+export function carriesSubnet(tr: Transfer, subnet: number): boolean {
+  return tr.subnet === subnet || tr.committees.includes(subnet);
 }
 
 export class NetworkRenderer {
@@ -141,7 +149,7 @@ export class NetworkRenderer {
     ctx.lineCap = 'round';
     for (const tr of active) {
       if (tr.layer === 'announce' && !view.showAnnounce) continue;
-      const related = (focus < 0 || tr.subnet === focus) && (node < 0 || tr.from === node || tr.to === node);
+      const related = (focus < 0 || carriesSubnet(tr, focus)) && (node < 0 || tr.from === node || tr.to === node);
       const focused = focus >= 0 || node >= 0;
       const alpha = related ? (focused ? 0.95 : 0.7) : 0.05;
       const x0 = layout.x[tr.from];
@@ -163,8 +171,9 @@ export class NetworkRenderer {
       ctx.lineTo(hx, hy);
       ctx.stroke();
       if (tr.layer === 'announce') continue;
+      const aggregate = tr.committees.length > 1;
       ctx.beginPath();
-      ctx.arc(hx, hy, tr.layer === 'wasted' ? 1.8 : 2.6, 0, Math.PI * 2);
+      ctx.arc(hx, hy, tr.layer === 'wasted' ? 1.8 : aggregate ? 3.4 : 2.6, 0, Math.PI * 2);
       ctx.fillStyle = tr.layer === 'wasted' && view.colorMode === 'subnet'
         ? `oklch(0.70 0.18 35 / ${alpha})`
         : color;
@@ -218,7 +227,6 @@ export class NetworkRenderer {
     const ctx = this.ctx;
     const t = view.t;
     const pulse = 0.5 + 0.5 * Math.sin(view.clock / 140);
-    const mergesNeeded = Math.max(1, model.subnets - 1);
     for (const i of model.l2s) {
       const tl = model.l2[i]!;
       const x = layout.x[i];
@@ -237,14 +245,26 @@ export class NetworkRenderer {
         ctx.arc(x, y, R, a0, a1);
         ctx.arc(x, y, inner, a1, a0, true);
         ctx.closePath();
+        const viaAggregate = tl.slots[s].via === 'aggregate';
         if (st.kind === 'held') {
-          ctx.fillStyle = proverColor(s, model.subnets, tl.slots[s].prover, model.provers, dim ? 0.18 : 1);
+          ctx.fillStyle = heldColor(tl.slots[s], s, model.subnets, model.provers, dim ? 0.18 : 1);
           ctx.fill();
+          if (viaAggregate) {
+            // Outline: this subnet arrived inside another L2's aggregate.
+            ctx.strokeStyle = intermediateColor(dim ? 0.2 : 0.85);
+            ctx.lineWidth = 1;
+            ctx.stroke();
+          }
         } else {
           ctx.fillStyle = st.kind === 'fetching'
             ? subnetColor(s, model.subnets, dim ? 0.05 : 0.2)
             : `rgba(68,64,60,${dim ? 0.25 : 0.55})`;
           ctx.fill();
+          if (st.kind === 'fetching' && viaAggregate) {
+            ctx.strokeStyle = intermediateColor(dim ? 0.15 : 0.6);
+            ctx.lineWidth = 1;
+            ctx.stroke();
+          }
           if (st.kind === 'fetching' && st.progress > 0) {
             const outer = inner + (R - inner) * st.progress;
             ctx.beginPath();
@@ -276,7 +296,7 @@ export class NetworkRenderer {
       if (done > 0 && phase !== 'aggregated') {
         ctx.beginPath();
         ctx.moveTo(x, y);
-        ctx.arc(x, y, core * 0.62, -Math.PI / 2, -Math.PI / 2 + (done / mergesNeeded) * Math.PI * 2);
+        ctx.arc(x, y, core * 0.62, -Math.PI / 2, -Math.PI / 2 + Math.min(1, done / mergesNeeded(model, tl, t)) * Math.PI * 2);
         ctx.closePath();
         ctx.fillStyle = `oklch(0.84 0.15 85 / ${dimNode ? 0.3 : 0.9})`;
         ctx.fill();

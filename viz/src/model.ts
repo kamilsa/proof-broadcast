@@ -24,18 +24,34 @@ export interface Transfer {
   arrival: number;
   bytes: number;
   layer: Layer;
+  /** Proven subnet; −1 for an intermediate aggregate. */
   subnet: number;
+  /** L1 prover index, or the producing L2's index for an aggregate. */
   prover: number;
+  /** Committees the carried proof covers (one entry for a subnet proof). */
+  committees: number[];
 }
+
+/** `subnet` value of an intermediate aggregate in the node's events. */
+export const AGGREGATE_SUBNET = 65535;
+
+/** How an L2 came to hold a subnet. */
+export type SlotSource = '' | 'leaf' | 'aggregate';
 
 /** One L2's view of one subnet. Times are NaN until they happen. */
 export interface SubnetSlot {
   committedAt: number;
   heldAt: number;
-  /** Prover whose proof the L2 chose (−1 until chosen). */
+  /** Prover whose proof the L2 chose (−1 until chosen, or via an aggregate). */
   prover: number;
   /** Node that delivered the final part of the proof. */
   from: number;
+  /** Whether the subnet came in its own proof or inside a fetched aggregate. */
+  via: SlotSource;
+  /** Via an aggregate: the L2 node that produced it (−1 if unknown). */
+  origin: number;
+  /** Via an aggregate: its committee key (`0-1-5`). */
+  aggKey: string;
   /** Partial mode: (time, chunks held) steps. */
   chunkSteps: Array<[number, number]>;
   /** Other proofs of this subnet the L2 turned down (partial) or received anyway (gossipsub). */
@@ -52,12 +68,40 @@ export interface Merge {
   right: number[];
   /** Union of left and right, sorted. */
   subnets: number[];
+  /** The result was advertised to other L2s as an intermediate proof. */
+  published: boolean;
+  /** False if the result was discarded (subsumed while running). */
+  kept: boolean;
+}
+
+/** Another L2's intermediate aggregate this L2 fetched (or started to). */
+export interface FetchedAggregate {
+  key: string;
+  committees: number[];
+  /** Producing L2 node (−1 if unknown). */
+  origin: number;
+  committedAt: number;
+  heldAt: number;
+  from: number;
+  /** It replaced items the L2 already held. */
+  subsume: boolean;
+  /** 2→1 recursions it spares the L2 (newly covered committees − 1). */
+  saves: number;
 }
 
 export interface L2Timeline {
   node: number;
   slots: SubnetSlot[];
   merges: Merge[];
+  fetched: FetchedAggregate[];
+  /** Own aggregates advertised to other L2s. */
+  published: Array<{ t: number; committees: number[] }>;
+  /** Items dropped for a subsuming aggregate. */
+  dropped: Array<{ t: number; subnets: number[] }>;
+  /** Other L2s' aggregates turned down (or received anyway, gossipsub). */
+  aggDeclined: number;
+  /** 2→1 recursions this L2 does not need thanks to fetched aggregates. */
+  mergesSaved: number;
   allSubnetsAt: number;
   aggregatedAt: number;
   firstHeldAt: number;
@@ -79,12 +123,16 @@ export interface SubnetInfo {
   provers: ProverInfo[];
   /** Sorted times at which each L2 first held this subnet. */
   heldTimes: number[];
+  /** Sorted times at which an L2 first held it inside a fetched aggregate. */
+  aggHoldTimes: number[];
 }
 
 export interface LogEntry {
   t: number;
   node: number;
   subnet: number;
+  /** Aggregate entries: every committee involved (for subnet filtering). */
+  subnets?: number[];
   kind: string;
   text: string;
 }
@@ -103,6 +151,8 @@ export interface Model {
   provers: number;
   chunkCount: number;
   aggregationMs: number;
+  /** L2s published intermediate aggregates in this run. */
+  intermediates: boolean;
   nodes: NodeInfo[];
   l1s: number[];
   l2s: number[];
@@ -148,9 +198,18 @@ export function parseSubnetList(v: unknown): number[] {
 
 function emptySlot(): SubnetSlot {
   return {
-    committedAt: NaN, heldAt: NaN, prover: -1, from: -1, chunkSteps: [],
-    declined: 0, redundant: 0, wastedBytes: 0, usefulBytes: 0,
+    committedAt: NaN, heldAt: NaN, prover: -1, from: -1, via: '', origin: -1, aggKey: '',
+    chunkSteps: [], declined: 0, redundant: 0, wastedBytes: 0, usefulBytes: 0,
   };
+}
+
+/** Committees of a transfer or aggregate event: the `committees` list, else
+ * the subnet itself for a subnet proof. */
+function committeesOf(ev: Record<string, unknown>): number[] {
+  const list = parseSubnetList(ev.committees);
+  if (list.length) return list;
+  const subnet = num(ev.subnet, -1);
+  return subnet >= 0 && subnet !== AGGREGATE_SUBNET ? [subnet] : [];
 }
 
 function kib(bytes: number): string {
@@ -202,12 +261,20 @@ export function buildModel(
   const l2: Array<L2Timeline | undefined> = nodes.map(node => node.role === 'l2'
     ? {
       node: node.idx, slots: Array.from({ length: subnets }, emptySlot), merges: [],
+      fetched: [], published: [], dropped: [], aggDeclined: 0, mergesSaved: 0,
       allSubnetsAt: NaN, aggregatedAt: NaN, firstHeldAt: NaN, rxBytes: 0, wastedBytes: 0,
     }
     : undefined);
+  // An aggregate's `prover` is its producer's L2 index (`l2_index` prop).
+  const l2ByIndex = new Map<number, number>();
+  header.nodes.forEach((n, idx) => {
+    const index = n.props?.l2_index;
+    if (nodes[idx].role === 'l2' && typeof index === 'number') l2ByIndex.set(index, idx);
+  });
+  const originOf = (ev: RawEvent) => l2ByIndex.get(num(ev.prover, -1)) ?? -1;
 
   const subnetInfo: SubnetInfo[] = Array.from({ length: subnets }, (_, subnet) => ({
-    subnet, provers: [], heldTimes: [],
+    subnet, provers: [], heldTimes: [], aggHoldTimes: [],
   }));
   for (const i of l1s) {
     const node = nodes[i];
@@ -225,10 +292,36 @@ export function buildModel(
   const logs: LogEntry[] = [];
   const publishTimes: number[] = [];
   const pending: Array<Merge | undefined>[] = nodes.map(() => []);
-  const log = (t: number, node: number, subnet: number, kind: string, text: string) =>
-    logs.push({ t, node, subnet, kind, text });
+  const log = (t: number, node: number, subnet: number, kind: string, text: string, list?: number[]) =>
+    logs.push(list ? { t, node, subnet, subnets: list, kind, text } : { t, node, subnet, kind, text });
   const tag = (ev: RawEvent) => `S${num(ev.subnet)}·p${num(ev.prover)}`;
   const nameOf = (i: unknown) => (valid(i) ? nodes[i].name : '?');
+  const aggTag = (ev: RawEvent, list: number[]) => {
+    const origin = originOf(ev);
+    return `{${list.join(',')}} by ${origin >= 0 ? nodes[origin].name : `L2 #${num(ev.prover)}`}`;
+  };
+  /** The aggregate an L2 is fetching, created on first sight. */
+  const fetchedAgg = (timeline: L2Timeline, ev: RawEvent, list: number[], t: number) => {
+    const key = list.join('-');
+    let agg = timeline.fetched.find(f => f.key === key && f.origin === originOf(ev));
+    if (!agg) {
+      agg = {
+        key, committees: list, origin: originOf(ev), committedAt: t, heldAt: NaN, from: -1,
+        subsume: ev.subsume === true, saves: 0,
+      };
+      timeline.fetched.push(agg);
+      for (const s of list) {
+        const slot = timeline.slots[s];
+        if (slot && Number.isNaN(slot.committedAt)) {
+          slot.committedAt = t;
+          slot.via = 'aggregate';
+          slot.origin = agg.origin;
+          slot.aggKey = key;
+        }
+      }
+    }
+    return agg;
+  };
 
   const sorted = [...rawEvents].sort((a, b) => a.t - b.t);
   let end = 0;
@@ -247,7 +340,9 @@ export function buildModel(
         if (!valid(to) || !(arrival >= t)) break;
         const layer = (LAYERS as string[]).includes(String(ev.layer)) ? ev.layer as Layer : 'wasted';
         transfers.push({
-          from: node, to, t, arrival, bytes: num(ev.bytes), layer, subnet, prover: num(ev.prover, -1),
+          from: node, to, t, arrival, bytes: num(ev.bytes), layer,
+          subnet: subnet === AGGREGATE_SUBNET ? -1 : subnet, prover: num(ev.prover, -1),
+          committees: committeesOf(ev),
         });
         end = Math.max(end, arrival);
         break;
@@ -263,6 +358,7 @@ export function buildModel(
         if (slot && Number.isNaN(slot.committedAt)) {
           slot.committedAt = t;
           slot.prover = num(ev.prover);
+          slot.via = 'leaf';
         }
         log(t, node, subnet, 'commit', `Fetching ${tag(ev)} from ${nameOf(ev.from_node)}`);
         break;
@@ -271,7 +367,7 @@ export function buildModel(
         log(t, node, subnet, 'decline', `Declined ${tag(ev)} — S${subnet} already chosen`);
         break;
       case 'chunk_received':
-        if (slot && slot.prover === num(ev.prover, slot.prover)) {
+        if (slot && slot.via !== 'aggregate' && slot.prover === num(ev.prover, slot.prover)) {
           const held = num(ev.held);
           const last = slot.chunkSteps.at(-1);
           if (!last || held > last[1]) slot.chunkSteps.push([t, held]);
@@ -285,6 +381,7 @@ export function buildModel(
           else if (Number.isNaN(slot.committedAt)) {
             slot.committedAt = t;
             slot.prover = num(ev.prover);
+            slot.via = 'leaf';
           }
         }
         log(t, node, subnet, ev.redundant ? 'dup' : 'chunk', ev.redundant
@@ -296,6 +393,7 @@ export function buildModel(
           slot.heldAt = t;
           slot.prover = num(ev.prover);
           slot.from = valid(ev.from_node) ? ev.from_node : -1;
+          slot.via = 'leaf';
           if (Number.isNaN(slot.committedAt)) slot.committedAt = t;
           if (timeline && Number.isNaN(timeline.firstHeldAt)) timeline.firstHeldAt = t;
           subnetInfo[subnet].heldTimes.push(t);
@@ -312,6 +410,7 @@ export function buildModel(
         const right = parseSubnetList(ev.right_subnets);
         const merge: Merge = {
           start: t, end: NaN, left, right, subnets: [...left, ...right].sort((a, b) => a - b),
+          published: false, kept: true,
         };
         timeline?.merges.push(merge);
         pending[node].push(merge);
@@ -326,17 +425,98 @@ export function buildModel(
         // (traces without subnet lists only carry sizes).
         let idx = queue.findIndex(m => m && m.subnets.join('-') === key);
         if (idx < 0) idx = queue.findIndex(m => m !== undefined);
+        const kept = ev.kept !== false;
         if (idx >= 0) {
           queue[idx]!.end = t;
+          queue[idx]!.kept = kept;
           queue[idx] = undefined;
         }
-        log(t, node, -1, 'merge', `2→1 recursion done: aggregate covers ${num(ev.covered, subnetsDone.length)} subnets`);
+        log(t, node, -1, 'merge', kept
+          ? `2→1 recursion done: aggregate covers ${num(ev.covered, subnetsDone.length)} subnets`
+          : `2→1 recursion done but discarded: {${subnetsDone.join(',')}} was subsumed`);
         break;
       }
       case 'aggregate_complete':
         if (timeline) timeline.aggregatedAt = t;
         log(t, node, -1, 'aggregated', `Aggregate proof complete (${subnets} subnets)`);
         break;
+      case 'intermediate_published': {
+        const list = committeesOf(ev);
+        const key = list.join('-');
+        timeline?.published.push({ t, committees: list });
+        const merge = timeline?.merges.filter(m => m.subnets.join('-') === key && m.end <= t).at(-1);
+        if (merge) merge.published = true;
+        log(t, node, -1, 'publish', `Published intermediate aggregate {${list.join(',')}}`, list);
+        break;
+      }
+      case 'intermediate_committed': {
+        const list = committeesOf(ev);
+        if (timeline) fetchedAgg(timeline, ev, list, t);
+        log(t, node, -1, 'commit',
+          `Fetching aggregate ${aggTag(ev, list)} from ${nameOf(ev.from_node)}${ev.subsume ? ' (subsumes held items)' : ''}`, list);
+        break;
+      }
+      case 'intermediate_declined':
+        if (timeline) timeline.aggDeclined += 1;
+        log(t, node, -1, 'decline', `Declined aggregate ${aggTag(ev, committeesOf(ev))} — overlaps what it holds`, committeesOf(ev));
+        break;
+      case 'intermediate_chunk_received': {
+        const list = committeesOf(ev);
+        if (timeline) {
+          const key = list.join('-');
+          const held = num(ev.held);
+          for (const s of list) {
+            const own = timeline.slots[s];
+            if (!own || own.via !== 'aggregate' || own.aggKey !== key) continue;
+            const last = own.chunkSteps.at(-1);
+            if (!last || held > last[1]) own.chunkSteps.push([t, held]);
+          }
+        }
+        log(t, node, -1, num(ev.added) > 0 ? 'chunk' : 'dup',
+          `Chunks of aggregate {${list.join(',')}} from ${nameOf(ev.from_node)}: +${num(ev.added)} new, ${num(ev.dup)} dup (${num(ev.held)}/${chunkCount})`, list);
+        break;
+      }
+      case 'intermediate_received': {
+        const list = committeesOf(ev);
+        if (timeline && ev.redundant) timeline.aggDeclined += 1;
+        else if (timeline) fetchedAgg(timeline, ev, list, t);
+        log(t, node, -1, ev.redundant ? 'dup' : 'chunk', ev.redundant
+          ? `Redundant aggregate ${aggTag(ev, list)} from ${nameOf(ev.from_node)}`
+          : `Aggregate ${aggTag(ev, list)} from ${nameOf(ev.from_node)}`, list);
+        break;
+      }
+      case 'intermediate_complete': {
+        const list = committeesOf(ev);
+        if (timeline) {
+          const agg = fetchedAgg(timeline, ev, list, t);
+          agg.heldAt = t;
+          agg.from = valid(ev.from_node) ? ev.from_node : -1;
+          agg.saves = Math.max(0, parseSubnetList(ev.new).length - 1);
+          timeline.mergesSaved += agg.saves;
+          if (Number.isNaN(timeline.firstHeldAt)) timeline.firstHeldAt = t;
+          for (const s of list) {
+            const own = timeline.slots[s];
+            if (!own || own.heldAt <= t) continue;
+            own.heldAt = t;
+            own.via = 'aggregate';
+            own.origin = agg.origin;
+            own.aggKey = agg.key;
+            own.from = agg.from;
+            own.prover = -1;
+            if (Number.isNaN(own.committedAt)) own.committedAt = t;
+            subnetInfo[s].heldTimes.push(t);
+            subnetInfo[s].aggHoldTimes.push(t);
+          }
+        }
+        log(t, node, -1, 'held', `Holds aggregate ${aggTag(ev, list)} — ${num(ev.subnets_done)}/${subnets} subnets`, list);
+        break;
+      }
+      case 'item_dropped': {
+        const list = parseSubnetList(ev.subnets);
+        timeline?.dropped.push({ t, subnets: list });
+        log(t, node, -1, 'decline', `Dropped held item {${list.join(',')}} — inside a fetched aggregate`, list);
+        break;
+      }
       default:
         break;
     }
@@ -378,6 +558,7 @@ export function buildModel(
 
   for (const info of subnetInfo) {
     info.heldTimes.sort((a, b) => a - b);
+    info.aggHoldTimes.sort((a, b) => a - b);
     for (const p of info.provers) p.holdTimes.sort((a, b) => a - b);
   }
   const allSubnetsTimes = l2s.map(i => l2[i]!.allSubnetsAt).filter(Number.isFinite).sort((a, b) => a - b);
@@ -405,6 +586,8 @@ export function buildModel(
   return {
     title: String(meta.title || mode), mode, meta, subnets, provers, chunkCount,
     aggregationMs: num(meta.aggregation_ms, 290),
+    intermediates: meta.intermediate_proofs === true
+      || l2s.some(i => l2[i]!.published.length > 0 || l2[i]!.fetched.length > 0),
     nodes, l1s, l2s, l2, subnetInfo, transfers, maxFlight, inbound, edges, logs, milestones,
     allSubnetsTimes, aggregatedTimes, arrivals, rxCum, wastedCum, end,
   };

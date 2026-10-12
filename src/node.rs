@@ -18,7 +18,7 @@ use libp2p::{Multiaddr, PeerId, Swarm};
 use tokio::time::{self, Duration, Instant};
 use tracing::{info, warn};
 
-use crate::aggregation::{Aggregator, Job, Subnets, subnet_list};
+use crate::aggregation::{Aggregator, Step, Subnets, subnet_list};
 use crate::event;
 use crate::gossip_mode::ProofMessage;
 use crate::network::{
@@ -28,7 +28,10 @@ use crate::network::{
 use crate::partial_mode::{
     CellBitmap, ChunkBody, OutgoingProof, PartialState, PartsMetadata, ProofAssembly,
 };
-use crate::proof::{MAX_CHUNKS, ProofId, SubnetLedger, Verdict, make_proof, split};
+use crate::proof::{
+    CoverageLedger, FetchPolicy, MAX_CHUNKS, MAX_SUBNETS, ProofId, Verdict, make_aggregate,
+    make_proof, mask_of, split, subnets_of,
+};
 
 /// Propagation protocol.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -79,7 +82,8 @@ pub struct Cli {
     #[arg(long, default_value_t = 0)]
     pub subnet: u16,
 
-    /// Index of this L1 prover within its subnet.
+    /// L1: index within its subnet. L2: index among L2 provers (labels the
+    /// intermediate aggregates it publishes).
     #[arg(long, default_value_t = 0)]
     pub prover: u16,
 
@@ -128,6 +132,19 @@ pub struct Cli {
     #[arg(long, default_value_t = 1)]
     pub aggregation_workers: usize,
 
+    /// L2: publish intermediate aggregates (never the final one) on the
+    /// proofs topic, so other L2s can fetch them instead of recursing.
+    #[arg(long, default_value_t = false)]
+    pub intermediate_proofs: bool,
+
+    /// Smallest aggregate, in committees, an L2 publishes.
+    #[arg(long, default_value_t = 2)]
+    pub intermediate_min_committees: usize,
+
+    /// Which advertised proofs an L2 fetches.
+    #[arg(long, value_enum, default_value_t = FetchPolicy::Disjoint)]
+    pub intermediate_fetch: FetchPolicy,
+
     #[arg(long, default_value_t = 15)]
     pub warmup_secs: u64,
 
@@ -172,8 +189,11 @@ impl Cli {
     }
 
     pub fn validate(&self) -> Result<(), String> {
-        if self.subnets == 0 || self.subnets > u16::MAX as usize {
-            return Err(format!("subnets must be in 1..=65535, got {}", self.subnets));
+        if self.subnets == 0 || self.subnets > MAX_SUBNETS {
+            return Err(format!(
+                "subnets must be in 1..={MAX_SUBNETS}, got {}",
+                self.subnets
+            ));
         }
         if self.role == Role::L1 && self.subnet as usize >= self.subnets {
             return Err(format!(
@@ -193,11 +213,24 @@ impl Cli {
         if self.aggregation_workers == 0 {
             return Err("aggregation workers must be positive".to_string());
         }
+        if self.intermediate_min_committees < 2 {
+            return Err(format!(
+                "intermediate min committees must be at least 2, got {}",
+                self.intermediate_min_committees
+            ));
+        }
         self.gossip_tuning().mesh.validate()
     }
 
     fn proof_len(&self) -> usize {
         self.proof_size_kib.saturating_mul(1024)
+    }
+
+    /// Whether a finished merge covering `covered` committees is published.
+    fn publishes_intermediate(&self, covered: usize) -> bool {
+        self.intermediate_proofs
+            && covered >= self.intermediate_min_committees
+            && covered < self.subnets
     }
 }
 
@@ -206,18 +239,31 @@ impl Cli {
 #[derive(Debug, Clone, Default)]
 pub struct NodeReport {
     pub published: bool,
+    /// Committees covered by fully received proofs.
     pub subnets_done: usize,
     pub first_proof_ms: Option<u64>,
     pub all_subnets_ms: Option<u64>,
     pub aggregate_ms: Option<u64>,
-    /// Hash chosen per subnet (L2).
+    /// First proof claimed per subnet (L2).
     pub committed: Vec<Option<[u8; 32]>>,
-    /// Gossipsub mode: proofs received from an already-served subnet.
+    /// Gossipsub mode: proofs received whose committees were already claimed.
     pub redundant_proofs: usize,
     /// Partial mode: chunks received that were already held.
     pub duplicate_chunks: usize,
-    /// Proofs declined because their subnet was already chosen.
+    /// Subnet proofs declined because their subnet was already claimed.
     pub declined: usize,
+    /// Own intermediate aggregates published.
+    pub intermediates_published: usize,
+    /// Other L2s' aggregates fully received.
+    pub intermediates_fetched: usize,
+    /// Other L2s' aggregates declined (overlapping what we hold).
+    pub intermediates_declined: usize,
+    /// 2→1 recursions started.
+    pub merges_run: usize,
+    /// Recursions whose result was discarded (subsumed while running).
+    pub merges_discarded: usize,
+    /// Held items dropped for a subsuming aggregate.
+    pub items_dropped: usize,
     pub tx_bytes: u64,
     pub rx_bytes: u64,
 }
@@ -229,7 +275,7 @@ struct Node {
     swarm: Swarm<SimBehaviour>,
     topic: IdentTopic,
     start: Instant,
-    ledger: SubnetLedger,
+    ledger: CoverageLedger,
     aggregator: Aggregator,
     jobs: FuturesUnordered<JobFuture>,
     partial: PartialState,
@@ -247,25 +293,17 @@ impl Node {
         subscribed >= self.cli.proofs_mesh_n.min(connected).max(1)
     }
 
-    // ── L1 ──────────────────────────────────────────────────────────────
-
-    fn publish(&mut self, late_ms: u64) {
-        let proof = make_proof(self.cli.seed, self.cli.proof_len());
-        let id = ProofId::for_proof(self.cli.subnet, self.cli.prover, &proof, self.cli.chunk_count);
-        let fanout = topic_peer_count(&self.swarm, &self.topic);
-        let result = match self.cli.mode {
-            Mode::Gossipsub => {
-                let msg = ProofMessage {
-                    subnet: id.subnet,
-                    prover: id.prover,
-                    data: proof,
-                };
-                self.swarm
-                    .behaviour_mut()
-                    .gossipsub
-                    .publish(self.topic.clone(), msg.encode())
-                    .map(|_| ())
-            }
+    /// Publish a complete proof we produced (an L1 proof, or an L2's
+    /// intermediate aggregate) in the configured mode.
+    fn publish_proof(&mut self, id: ProofId, proof: Vec<u8>) -> Result<(), String> {
+        match self.cli.mode {
+            Mode::Gossipsub => self
+                .swarm
+                .behaviour_mut()
+                .gossipsub
+                .publish(self.topic.clone(), ProofMessage::new(&id, proof).encode())
+                .map(|_| ())
+                .map_err(|e| e.to_string()),
             Mode::Partial => {
                 let source = ProofAssembly::from_chunks(id, split(&proof, id.chunks()));
                 let outgoing =
@@ -276,9 +314,18 @@ impl Node {
                     .gossipsub
                     .publish_partial(self.topic.hash(), outgoing)
                     .map(|_| ())
+                    .map_err(|e| e.to_string())
             }
-        };
-        match result {
+        }
+    }
+
+    // ── L1 ──────────────────────────────────────────────────────────────
+
+    fn publish(&mut self, late_ms: u64) {
+        let proof = make_proof(self.cli.seed, self.cli.proof_len());
+        let id = ProofId::for_proof(self.cli.subnet, self.cli.prover, &proof, self.cli.chunk_count);
+        let fanout = topic_peer_count(&self.swarm, &self.topic);
+        match self.publish_proof(id, proof) {
             Ok(()) => {
                 self.report.published = true;
                 event!(
@@ -301,37 +348,93 @@ impl Node {
 
     // ── L2: shared ──────────────────────────────────────────────────────
 
-    /// The chosen proof for `id.subnet` is fully held.
-    fn proof_complete(&mut self, id: &ProofId, from: PeerId) {
-        if !self.ledger.complete(id.subnet) {
-            return;
+    fn verdict(&self, id: &ProofId) -> Verdict {
+        self.ledger.verdict(id, &self.aggregator.units())
+    }
+
+    /// Claim `id` for download; a subsuming aggregate reserves its committees.
+    fn claim(&mut self, id: &ProofId, verdict: Verdict) {
+        self.ledger.commit(id);
+        if verdict == Verdict::Subsume {
+            self.aggregator.reserve(id.committees);
         }
+        self.report.committed = self.committed();
+    }
+
+    fn committed(&self) -> Vec<Option<[u8; 32]>> {
+        (0..self.ledger.subnets())
+            .map(|s| self.ledger.committed(s))
+            .collect()
+    }
+
+    /// Count a declined proof; true the first time it is declined.
+    fn decline(&mut self, id: &ProofId) -> bool {
+        if !self.ledger.decline(id) {
+            return false;
+        }
+        if id.is_aggregate() {
+            self.report.intermediates_declined += 1;
+        } else {
+            self.report.declined += 1;
+        }
+        true
+    }
+
+    /// A claimed proof (subnet proof or aggregate) is fully held.
+    fn proof_complete(&mut self, id: &ProofId, from: PeerId) {
+        let Some(new) = self.ledger.complete(id) else {
+            return;
+        };
         let now = self.elapsed_ms();
         self.report.first_proof_ms.get_or_insert(now);
         self.report.subnets_done = self.ledger.subnets_done();
-        event!(
-            "proof_complete",
-            subnet = id.subnet,
-            prover = id.prover,
-            hash = id.label(),
-            from = from,
-            subnets_done = self.report.subnets_done
-        );
-        if self.ledger.all_done() {
+        if id.is_aggregate() {
+            self.report.intermediates_fetched += 1;
+            event!(
+                "intermediate_complete",
+                committees = subnet_list(&id.subnets()),
+                mask = id.committees,
+                covered = id.covered(),
+                prover = id.prover,
+                hash = id.label(),
+                from = from,
+                new = subnet_list(&subnets_of(new)),
+                subnets_done = self.report.subnets_done
+            );
+        } else {
+            event!(
+                "proof_complete",
+                subnet = id.subnet,
+                prover = id.prover,
+                hash = id.label(),
+                from = from,
+                subnets_done = self.report.subnets_done
+            );
+        }
+        if self.ledger.all_done() && self.report.all_subnets_ms.is_none() {
             self.report.all_subnets_ms = Some(now);
             event!("all_subnets_complete", subnets = self.ledger.subnets());
         }
-        let jobs = self.aggregator.add_leaf(id.subnet);
-        self.after_aggregation_step(jobs);
+        let step = self.aggregator.add_item(id.subnets());
+        self.after_aggregation_step(step);
     }
 
-    fn after_aggregation_step(&mut self, jobs: Vec<Job>) {
+    fn after_aggregation_step(&mut self, step: Step) {
+        for item in &step.dropped {
+            self.report.items_dropped += 1;
+            event!(
+                "item_dropped",
+                subnets = subnet_list(item),
+                covered = item.len()
+            );
+        }
         if self.aggregator.is_complete() && self.report.aggregate_ms.is_none() {
             self.report.aggregate_ms = Some(self.elapsed_ms());
             event!("aggregate_complete", subnets = self.ledger.subnets());
         }
         let duration = Duration::from_millis(self.cli.aggregation_ms);
-        for job in jobs {
+        for job in step.jobs {
+            self.report.merges_run += 1;
             event!(
                 "aggregation_started",
                 left = job.left.len(),
@@ -349,13 +452,50 @@ impl Node {
     }
 
     fn on_job_done(&mut self, item: Subnets) {
+        let step = self.aggregator.job_done(item.clone());
         event!(
             "aggregation_done",
             covered = item.len(),
-            subnets = subnet_list(&item)
+            subnets = subnet_list(&item),
+            kept = step.kept
         );
-        let jobs = self.aggregator.job_done(item);
-        self.after_aggregation_step(jobs);
+        if !step.kept {
+            self.report.merges_discarded += 1;
+        } else if self.cli.publishes_intermediate(item.len()) {
+            self.publish_intermediate(&item);
+        }
+        self.after_aggregation_step(step);
+    }
+
+    /// Advertise a finished merge to the other L2 provers.
+    fn publish_intermediate(&mut self, item: &[u16]) {
+        let mask = mask_of(item);
+        let proof = make_aggregate(self.cli.seed, mask, self.cli.proof_len());
+        let id = ProofId::for_aggregate(self.cli.prover, mask, &proof, self.cli.chunk_count);
+        self.ledger.own(&id);
+        match self.publish_proof(id, proof) {
+            Ok(()) => {
+                self.report.intermediates_published += 1;
+                event!(
+                    "intermediate_published",
+                    committees = subnet_list(item),
+                    mask = mask,
+                    covered = item.len(),
+                    prover = id.prover,
+                    hash = id.label(),
+                    bytes = id.proof_len,
+                    chunks = id.chunk_count
+                );
+            }
+            Err(err) => {
+                warn!(%err, "intermediate publish failed");
+                event!(
+                    "intermediate_publish_failed",
+                    committees = subnet_list(item),
+                    mask = mask
+                );
+            }
+        }
     }
 
     // ── L2: gossipsub ───────────────────────────────────────────────────
@@ -367,44 +507,58 @@ impl Node {
                 .gossipsub
                 .report_message_validation_result(&message_id, &source, acceptance);
         };
-        let Ok(msg) = ProofMessage::decode(data) else {
+        let Some(id) = ProofMessage::decode(data)
+            .ok()
+            .and_then(|msg| msg.id(self.cli.chunk_count))
+        else {
             validate(self, MessageAcceptance::Reject);
             return;
         };
-        let id = ProofId::for_proof(msg.subnet, msg.prover, &msg.data, self.cli.chunk_count);
-        match self.ledger.verdict(&id) {
-            Verdict::Free => {
-                self.ledger.commit(&id);
+        let verdict = self.verdict(&id);
+        let redundant = match verdict {
+            Verdict::Free | Verdict::Subsume => {
+                self.claim(&id, verdict);
                 validate(self, MessageAcceptance::Accept);
-                event!(
-                    "proof_received",
-                    subnet = id.subnet,
-                    prover = id.prover,
-                    hash = id.label(),
-                    from = source,
-                    bytes = data.len(),
-                    redundant = false
-                );
-                self.proof_complete(&id, source);
+                false
             }
             // Same bytes are deduplicated by message id; nothing to do.
-            Verdict::Mine => validate(self, MessageAcceptance::Ignore),
+            Verdict::Mine => {
+                validate(self, MessageAcceptance::Ignore);
+                return;
+            }
             Verdict::Taken => {
                 validate(self, MessageAcceptance::Ignore);
                 self.report.redundant_proofs += 1;
-                if self.ledger.decline(&id) {
-                    self.report.declined += 1;
-                }
-                event!(
-                    "proof_received",
-                    subnet = id.subnet,
-                    prover = id.prover,
-                    hash = id.label(),
-                    from = source,
-                    bytes = data.len(),
-                    redundant = true
-                );
+                self.decline(&id);
+                true
             }
+        };
+        if id.is_aggregate() {
+            event!(
+                "intermediate_received",
+                committees = subnet_list(&id.subnets()),
+                mask = id.committees,
+                covered = id.covered(),
+                prover = id.prover,
+                hash = id.label(),
+                from = source,
+                bytes = data.len(),
+                redundant = redundant,
+                subsume = verdict == Verdict::Subsume
+            );
+        } else {
+            event!(
+                "proof_received",
+                subnet = id.subnet,
+                prover = id.prover,
+                hash = id.label(),
+                from = source,
+                bytes = data.len(),
+                redundant = redundant
+            );
+        }
+        if !redundant {
+            self.proof_complete(&id, source);
         }
     }
 
@@ -432,7 +586,8 @@ impl Node {
                 return;
             }
         };
-        match self.ledger.verdict(&id) {
+        let verdict = self.verdict(&id);
+        match verdict {
             Verdict::Mine => {
                 // Republish when we gained chunks, or when a peer's metadata
                 // may be the first it heard of our request.
@@ -442,18 +597,29 @@ impl Node {
                 }
             }
             Verdict::Taken => {
-                if self.ledger.decline(&id) {
-                    self.report.declined += 1;
-                    event!(
-                        "proof_declined",
-                        subnet = id.subnet,
-                        prover = id.prover,
-                        hash = id.label(),
-                        from = peer
-                    );
+                if self.decline(&id) {
+                    if id.is_aggregate() {
+                        event!(
+                            "intermediate_declined",
+                            committees = subnet_list(&id.subnets()),
+                            mask = id.committees,
+                            covered = id.covered(),
+                            prover = id.prover,
+                            hash = id.label(),
+                            from = peer
+                        );
+                    } else {
+                        event!(
+                            "proof_declined",
+                            subnet = id.subnet,
+                            prover = id.prover,
+                            hash = id.label(),
+                            from = peer
+                        );
+                    }
                 }
             }
-            Verdict::Free => {
+            Verdict::Free | Verdict::Subsume => {
                 // Commit only to a proof this peer can actually serve.
                 let peer_chunks = body.as_ref().map_or(0, |b| b.present.count()).max(
                     metadata
@@ -464,19 +630,30 @@ impl Node {
                 if peer_chunks == 0 {
                     return;
                 }
-                self.ledger.commit(&id);
-                self.report.committed = (0..self.ledger.subnets())
-                    .map(|s| self.ledger.committed(s))
-                    .collect();
+                self.claim(&id, verdict);
                 self.partial.assemblies.insert(id.hash, ProofAssembly::new(id));
-                event!(
-                    "proof_committed",
-                    subnet = id.subnet,
-                    prover = id.prover,
-                    hash = id.label(),
-                    from = peer,
-                    peer_chunks = peer_chunks
-                );
+                if id.is_aggregate() {
+                    event!(
+                        "intermediate_committed",
+                        committees = subnet_list(&id.subnets()),
+                        mask = id.committees,
+                        covered = id.covered(),
+                        prover = id.prover,
+                        hash = id.label(),
+                        from = peer,
+                        peer_chunks = peer_chunks,
+                        subsume = verdict == Verdict::Subsume
+                    );
+                } else {
+                    event!(
+                        "proof_committed",
+                        subnet = id.subnet,
+                        prover = id.prover,
+                        hash = id.label(),
+                        from = peer,
+                        peer_chunks = peer_chunks
+                    );
+                }
                 if let Some(body) = body {
                     self.merge_chunks(&id, peer, &body);
                 }
@@ -495,18 +672,32 @@ impl Node {
             return false;
         }
         self.report.duplicate_chunks += out.duplicate;
-        event!(
-            "chunk_received",
-            subnet = id.subnet,
-            prover = id.prover,
-            hash = id.label(),
-            from = peer,
-            added = out.added,
-            dup = out.duplicate,
-            held = out.held
-        );
+        if id.is_aggregate() {
+            event!(
+                "intermediate_chunk_received",
+                committees = subnet_list(&id.subnets()),
+                mask = id.committees,
+                prover = id.prover,
+                hash = id.label(),
+                from = peer,
+                added = out.added,
+                dup = out.duplicate,
+                held = out.held
+            );
+        } else {
+            event!(
+                "chunk_received",
+                subnet = id.subnet,
+                prover = id.prover,
+                hash = id.label(),
+                from = peer,
+                added = out.added,
+                dup = out.duplicate,
+                held = out.held
+            );
+        }
         if out.invalid {
-            event!("proof_invalid", subnet = id.subnet, hash = id.label());
+            event!("proof_invalid", subnet = id.subnet, mask = id.committees, hash = id.label());
         }
         if out.completed.is_some() {
             self.proof_complete(id, peer);
@@ -556,9 +747,7 @@ impl Node {
         let (tx, rx) = gossip_byte_totals(&self.swarm);
         self.report.tx_bytes = tx;
         self.report.rx_bytes = rx;
-        self.report.committed = (0..self.ledger.subnets())
-            .map(|s| self.ledger.committed(s))
-            .collect();
+        self.report.committed = self.committed();
         event!("bytes", tx = tx, rx = rx);
         event!(
             "run_end",
@@ -567,7 +756,13 @@ impl Node {
             aggregated = self.report.aggregate_ms.is_some(),
             redundant_proofs = self.report.redundant_proofs,
             duplicate_chunks = self.report.duplicate_chunks,
-            declined = self.report.declined
+            declined = self.report.declined,
+            intermediates_published = self.report.intermediates_published,
+            intermediates_fetched = self.report.intermediates_fetched,
+            intermediates_declined = self.report.intermediates_declined,
+            merges_run = self.report.merges_run,
+            merges_discarded = self.report.merges_discarded,
+            items_dropped = self.report.items_dropped
         );
     }
 }
@@ -581,6 +776,8 @@ pub async fn run(cli: Cli) -> NodeReport {
         prover = cli.prover,
         seed = cli.seed,
         peers = cli.peers.len(),
+        intermediate_proofs = cli.intermediate_proofs,
+        intermediate_fetch = %cli.intermediate_fetch,
         "proof-broadcast starting"
     );
     let tuning = cli.gossip_tuning();
@@ -615,13 +812,14 @@ pub async fn run(cli: Cli) -> NodeReport {
 
     let subnets = cli.subnets;
     let workers = cli.aggregation_workers;
+    let policy = cli.intermediate_fetch;
     let is_l1 = cli.role == Role::L1;
     let mut node = Node {
         cli,
         swarm,
         topic,
         start,
-        ledger: SubnetLedger::new(subnets),
+        ledger: CoverageLedger::new(subnets, policy),
         aggregator: Aggregator::new(subnets, workers),
         jobs: FuturesUnordered::new(),
         partial: PartialState::default(),

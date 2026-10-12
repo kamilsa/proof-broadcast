@@ -98,10 +98,33 @@ class ArgsTests(unittest.TestCase):
         self.assertIn("--role l2", args)
         self.assertNotIn("--subnet ", args)
         self.assertNotIn("--publish-delay-ms", args)
+        self.assertNotIn("--intermediate", args)
+
+    def test_l2_prover_index_and_intermediate_flags(self) -> None:
+        nodes = shadow_sim.build_nodes(small_cfg()["sim"])
+        l2 = [n for n in nodes if n.role == "l2"]
+        self.assertEqual([n.prover for n in l2], list(range(8)))
+        cfg = small_cfg(intermediate_proofs=True, intermediate_min_committees=3,
+                        intermediate_fetch="subsume")
+        args = shadow_sim.build_args(l2[5], cfg, []).split()
+        self.assertIn("--intermediate-proofs", args)
+        rest = [a for a in args if a != "--intermediate-proofs"]
+        pairs = dict(zip(rest[::2], rest[1::2]))
+        self.assertEqual(pairs["--prover"], "5")
+        self.assertEqual(pairs["--intermediate-min-committees"], "3")
+        self.assertEqual(pairs["--intermediate-fetch"], "subsume")
+        # L1 provers never publish aggregates.
+        self.assertNotIn("--intermediate", shadow_sim.build_args(nodes[0], cfg, []))
+
+    def test_intermediate_settings_defaults(self) -> None:
+        p = shadow_sim.prover_settings(small_cfg()["sim"])
+        self.assertEqual((p["intermediate_proofs"], p["intermediate_min_committees"],
+                          p["intermediate_fetch"]), (False, 2, "disjoint"))
 
     def test_invalid_settings_are_rejected(self) -> None:
         for bad in ({"mode": "flood"}, {"chunk_count": 0}, {"chunk_count": 5000},
-                    {"proofs_mesh_n": 2}, {"subnets": 0}):
+                    {"proofs_mesh_n": 2}, {"subnets": 0}, {"subnets": 65},
+                    {"intermediate_min_committees": 1}, {"intermediate_fetch": "greedy"}):
             with self.subTest(bad=bad), self.assertRaises(SystemExit):
                 cfg = small_cfg(**bad)
                 shadow_sim.mode_setting(cfg["sim"])
@@ -177,6 +200,37 @@ class AnalyzeTests(unittest.TestCase):
             self.assertIn("<svg", html)
             self.assertIn("partial", html)
 
+    def test_intermediate_metrics(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "run-meta.json").write_text(json.dumps(
+                {"mode": "partial", "seed": 1, "run_index": 0, "subnets": 4,
+                 "proof_size_kib": 1, "intermediate_proofs": True,
+                 "intermediate_fetch": "disjoint"}))
+            write_host(root, "l1-s00-p0", [
+                "EVENT kind=proof_published t_ms=1000 subnet=0 prover=0 hash=aa"])
+            write_host(root, "l2-000", [
+                "EVENT kind=intermediate_published t_ms=1500 committees=0-1 mask=3 "
+                "covered=2 prover=0 hash=cc",
+                "EVENT kind=run_end t_ms=9000 role=l2 intermediates_published=1 "
+                "intermediates_fetched=0 intermediates_declined=2 merges_run=3"])
+            write_host(root, "l2-001", [
+                "EVENT kind=intermediate_complete t_ms=1800 committees=0-1 mask=3 "
+                "prover=0 hash=cc from=P1 new=0-1 subnets_done=2",
+                "EVENT kind=run_end t_ms=9000 role=l2 intermediates_published=0 "
+                "intermediates_fetched=1 intermediates_declined=0 merges_run=2"])
+            run = analyze.collect_run(root)
+            self.assertTrue(run["intermediate_proofs"])
+            self.assertEqual(run["intermediates_published_total"], 1)
+            self.assertEqual(run["intermediates_fetched_total"], 1)
+            self.assertEqual(run["l2_fetching_intermediates"], 1)
+            self.assertEqual(run["intermediate_latency_median_ms"], 300)
+            self.assertEqual(run["merges_run_median"], 2.5)
+            self.assertEqual(run["t0_ms"], 1000)  # aggregates never move the origin
+            analyze.print_summary(run)
+            analyze.write_html([run], root / "summary.html")
+            self.assertIn("+int (disjoint)", (root / "summary.html").read_text())
+
     def test_parse_event_line(self) -> None:
         ev = analyze.parse_event_line(
             "\x1b[32m INFO\x1b[0m event: EVENT kind=run_end t_ms=5 aggregated=true n=3 x=NA")
@@ -245,6 +299,46 @@ class ExportNetvizTests(unittest.TestCase):
             committed = next(e for e in events if e["kind"] == "proof_committed")
             self.assertEqual(committed["from_node"], 0)
             self.assertNotIn("from", committed)
+            self.assertEqual(transfers[0]["mask"], 1)
+            self.assertEqual(transfers[0]["committees"], "0")
+
+    def test_classifies_intermediate_transfers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.write_run(root)
+            # l2-001 publishes aggregate {0,1}; l2-000 fetches it, then gets a
+            # second copy of the chunks it already holds.
+            agg = "topic=/proofs/1 subnet=65535 prover=1 mask=3"
+            ev = "committees=0-1 mask=3 prover=1"
+            with (root / "shadow.data/hosts/l2-001/proof-broadcast.1000.stdout").open("a") as f:
+                f.write("\n".join([
+                    f"EVENT kind=intermediate_published t_ms=1500 t_us=1500000 {ev} covered=2 hash=cc",
+                    f"EVENT kind=wire_send t_ms=1500 t_us=1500010 peer=P1 id=d1 {agg} bytes=48 body=0",
+                    f"EVENT kind=wire_send t_ms=1600 t_us=1600000 peer=P1 id=d2 {agg} bytes=4200 body=4150",
+                    f"EVENT kind=wire_send t_ms=1700 t_us=1700000 peer=P1 id=d3 {agg} bytes=4200 body=4150",
+                ]) + "\n")
+            with (root / "shadow.data/hosts/l2-000/proof-broadcast.1000.stdout").open("a") as f:
+                f.write("\n".join([
+                    f"EVENT kind=wire_recv t_ms=1530 t_us=1530000 peer=P2 id=d1 {agg} bytes=48 body=0",
+                    f"EVENT kind=intermediate_committed t_ms=1530 t_us=1530010 {ev} from=P2 subsume=false",
+                    f"EVENT kind=wire_recv t_ms=1630 t_us=1630000 peer=P2 id=d2 {agg} bytes=4200 body=4150",
+                    f"EVENT kind=intermediate_chunk_received t_ms=1630 t_us=1630010 {ev} from=P2 added=4 dup=0 held=4",
+                    f"EVENT kind=intermediate_complete t_ms=1630 t_us=1630020 {ev} from=P2 new=1",
+                    f"EVENT kind=wire_recv t_ms=1730 t_us=1730000 peer=P2 id=d3 {agg} bytes=4200 body=4150",
+                    f"EVENT kind=intermediate_chunk_received t_ms=1730 t_us=1730010 {ev} from=P2 added=0 dup=4 held=4",
+                ]) + "\n")
+            out = root / "trace.ndjson"
+            export_netviz.export(root, out)
+            lines = [json.loads(line) for line in out.read_text().splitlines()]
+            header, events = lines[0], lines[1:]
+            self.assertEqual(header["nodes"][2]["props"].get("l2_index"), None)
+            aggs = [e for e in events if e["kind"] == "transfer" and e["subnet"] == 65535]
+            self.assertEqual([(t["node"], t["to"], t["layer"], t["committees"]) for t in aggs],
+                             [(2, 1, "announce", "0-1"), (2, 1, "chunk", "0-1"),
+                              (2, 1, "wasted", "0-1")])
+            kinds = {e["kind"] for e in events}
+            self.assertTrue({"intermediate_published", "intermediate_committed",
+                             "intermediate_complete"} <= kinds)
 
 
 if __name__ == "__main__":

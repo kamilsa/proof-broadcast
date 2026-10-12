@@ -82,17 +82,24 @@ def _med(values: list) -> float | None:
     return median(values) if values else None
 
 
+RUN_END_COUNTERS = ("redundant_proofs", "duplicate_chunks", "declined",
+                    "intermediates_published", "intermediates_fetched",
+                    "intermediates_declined", "merges_run", "merges_discarded",
+                    "items_dropped")
+
+
 def collect_run(run_dir: Path) -> dict:
     """Load one Shadow output directory into a summary dict."""
     meta = _load_json(run_dir / "run-meta.json")
     nodes = _load_json(run_dir / "nodes.json")
     hosts: dict[str, dict] = {}
     published: dict[str, int] = {}
+    agg_published: dict[str, int] = {}
     for name, path in iter_host_logs(run_dir):
         role = (nodes.get(name) or {}).get("role") or ("l1" if name.startswith("l1") else "l2")
-        rec: dict = {"role": role, "proofs": [], "all_subnets_ms": None,
+        rec: dict = {"role": role, "proofs": [], "intermediates": [], "all_subnets_ms": None,
                      "aggregate_ms": None, "sent": None, "rcvd": None,
-                     "redundant_proofs": 0, "duplicate_chunks": 0, "declined": 0,
+                     **{key: 0 for key in RUN_END_COUNTERS},
                      "published_ms": None}
         for line in path.read_text(errors="replace").splitlines():
             ev = parse_event_line(line)
@@ -102,8 +109,12 @@ def collect_run(run_dir: Path) -> dict:
             if kind == "proof_published":
                 rec["published_ms"] = ev["t_ms"]
                 published[str(ev.get("hash"))] = ev["t_ms"]
+            elif kind == "intermediate_published":
+                agg_published[str(ev.get("hash"))] = ev["t_ms"]
             elif kind == "proof_complete":
                 rec["proofs"].append((ev["t_ms"], str(ev.get("hash")), ev.get("subnet")))
+            elif kind == "intermediate_complete":
+                rec["intermediates"].append((ev["t_ms"], str(ev.get("hash"))))
             elif kind == "all_subnets_complete":
                 rec["all_subnets_ms"] = ev["t_ms"]
             elif kind == "aggregate_complete":
@@ -111,7 +122,7 @@ def collect_run(run_dir: Path) -> dict:
             elif kind == "bytes":
                 rec["sent"], rec["rcvd"] = ev.get("tx"), ev.get("rx")
             elif kind == "run_end":
-                for key in ("redundant_proofs", "duplicate_chunks", "declined"):
+                for key in RUN_END_COUNTERS:
                     rec[key] = int(ev.get(key) or 0)
         hosts[name] = rec
 
@@ -133,6 +144,12 @@ def collect_run(run_dir: Path) -> dict:
     for rec in l2.values():
         for _, h, subnet in rec["proofs"]:
             chosen.setdefault(subnet, set()).add(h)
+
+    agg_latency = sorted(t - agg_published[h] for rec in l2.values()
+                         for t, h in rec["intermediates"] if h in agg_published)
+
+    def counter(key: str) -> list[int]:
+        return [h[key] for h in l2.values()]
 
     subnets = int(meta.get("subnets") or len(chosen) or 0)
     proof_bytes = int(meta.get("proof_size_kib") or 0) * 1024
@@ -172,6 +189,18 @@ def collect_run(run_dir: Path) -> dict:
         "declined_median": _med([h["declined"] for h in l2.values()]),
         "proofs_per_subnet": (sum(len(v) for v in chosen.values()) / len(chosen))
         if chosen else None,
+        # Intermediate proofs (L2s publishing / fetching partial aggregates).
+        "intermediate_proofs": bool(meta.get("intermediate_proofs")),
+        "intermediate_fetch": meta.get("intermediate_fetch"),
+        "intermediates_published_total": sum(counter("intermediates_published")),
+        "intermediates_fetched_total": sum(counter("intermediates_fetched")),
+        "intermediates_fetched_median": _med(counter("intermediates_fetched")),
+        "intermediates_declined_median": _med(counter("intermediates_declined")),
+        "l2_fetching_intermediates": sum(1 for v in counter("intermediates_fetched") if v),
+        "intermediate_latency_median_ms": _med(agg_latency),
+        "merges_run_median": _med(counter("merges_run")),
+        "merges_discarded_total": sum(counter("merges_discarded")),
+        "items_dropped_total": sum(counter("items_dropped")),
         "hosts": {n: {k: h[k] for k in ("role", "sent", "rcvd", "all_subnets_ms",
                                          "aggregate_ms")} for n, h in hosts.items()},
     }
@@ -206,6 +235,18 @@ def print_summary(run: dict) -> None:
     print(f"   per L2 (median): redundant proofs {run['redundant_proofs_median']}, "
           f"duplicate chunks {run['duplicate_chunks_median']}, "
           f"declined {run['declined_median']};  distinct proofs used per subnet: {pps}")
+    if run.get("intermediate_proofs"):
+        print(f"   intermediates ({run.get('intermediate_fetch')}): "
+              f"published {run['intermediates_published_total']}, "
+              f"fetched {run['intermediates_fetched_total']} "
+              f"by {run['l2_fetching_intermediates']}/{n} L2s "
+              f"(median {run['intermediates_fetched_median']}, "
+              f"latency {_ms(run['intermediate_latency_median_ms'])}), "
+              f"declined/L2 median {run['intermediates_declined_median']}")
+        print(f"   merges/L2 median: {run['merges_run_median']} "
+              f"(without intermediates: {max(0, int(run['meta'].get('subnets') or 1) - 1)}), "
+              f"discarded {run['merges_discarded_total']}, "
+              f"items dropped {run['items_dropped_total']}")
 
 
 # ── history ──────────────────────────────────────────────────────────────────
@@ -289,7 +330,9 @@ def write_html(runs: list[dict], out_path: Path) -> None:
             ("collect t50", "col_t50_ms"), ("collect t95", "col_t95_ms"),
             ("agg tail", "agg_gap_median_ms"), ("proof latency", "proof_latency_median_ms"),
             ("L2 rx", "l2_rx_median"), ("redundancy", "redundancy"),
-            ("dup chunks", "duplicate_chunks_median"), ("proofs/subnet", "proofs_per_subnet")]
+            ("dup chunks", "duplicate_chunks_median"), ("proofs/subnet", "proofs_per_subnet"),
+            ("aggs fetched/L2", "intermediates_fetched_median"),
+            ("merges/L2", "merges_run_median")]
     rows = []
     series_agg, series_col = [], []
     for i, run in enumerate(runs):
@@ -297,8 +340,11 @@ def write_html(runs: list[dict], out_path: Path) -> None:
         label = f"{run['label']} #{run.get('seed')}"
         series_agg.append((label, color, run.get("agg_delays_ms") or [], run["n_l2"]))
         series_col.append((label, color, run.get("col_delays_ms") or [], run["n_l2"]))
+        mode = str(run.get("mode"))
+        if run.get("intermediate_proofs"):
+            mode += f" +int ({run.get('intermediate_fetch')})"
         cells = [f'<span class="sw" style="background:{color}"></span>{escape(run["label"])}',
-                 escape(str(run.get("mode"))), escape(str(run.get("seed"))),
+                 escape(mode), escape(str(run.get("seed"))),
                  f'{run["aggregated"]}/{run["n_l2"]}']
         for _, key in cols[4:]:
             v = run.get(key)
@@ -306,7 +352,8 @@ def write_html(runs: list[dict], out_path: Path) -> None:
                 cells.append(_kib(v))
             elif key in ("redundancy", "proofs_per_subnet"):
                 cells.append("NA" if v is None else f"{v:.2f}")
-            elif key in ("duplicate_chunks_median",):
+            elif key in ("duplicate_chunks_median", "intermediates_fetched_median",
+                         "merges_run_median"):
                 cells.append("NA" if v is None else f"{v:g}")
             else:
                 cells.append(_ms(v))
@@ -340,7 +387,9 @@ svg .a {{ fill:var(--muted); font-size:11px; }} svg .t {{ fill:var(--fg); font-s
 <p>L2 provers collect one proof per subnet, then aggregate with 2→1 recursion.
 Times are relative to the first L1 publish. "agg tail" is the median time from
 holding every subnet to finishing the aggregate. "redundancy" is the median L2 rx
-over subnets × proof size.</p>
+over subnets × proof size. With intermediate proofs ("+int"), L2s also publish
+their partial aggregates; "aggs fetched/L2" is how many each L2 used instead of
+recursing itself, and "merges/L2" the 2→1 recursions it ran (subnets − 1 without).</p>
 <div class="wrap"><table><thead><tr>{head}</tr></thead><tbody>{"".join(rows)}</tbody></table></div>
 <div class="charts">
 <div>{svg_cdf(series_agg, "L2 aggregate complete (CDF)")}</div>

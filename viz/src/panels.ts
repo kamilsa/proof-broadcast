@@ -2,10 +2,11 @@
 // node detail with the aggregation tree, and the event log (right).
 
 import type { LogEntry, Model } from './model';
-import { UI, proverColor, subnetColor } from './palette';
+import { UI, heldColor, intermediateColor, proverColor, subnetColor } from './palette';
 import { PHASE_COLOR, focusSubnet, type ViewState } from './render';
 import {
-  countUpTo, isMerging, l2Phase, mergesDone, networkCounts, slotState, subnetsHeld, type L2Phase,
+  aggregatesFetched, aggregatesPublished, countUpTo, isMerging, l2Phase, mergesDone, mergesNeeded,
+  networkCounts, slotState, subnetsHeld, type L2Phase,
 } from './state';
 import { drawTree } from './tree';
 
@@ -60,7 +61,7 @@ type Tab = 'matrix' | 'detail' | 'log';
 export class Panels {
   private model?: Model;
   private statValues = new Map<string, HTMLElement>();
-  private subnetRows: Array<{ row: HTMLElement; pips: HTMLElement[]; bar: HTMLElement; segs: HTMLElement[]; count: HTMLElement }> = [];
+  private subnetRows: Array<{ row: HTMLElement; pips: HTMLElement[]; bar: HTMLElement; segs: HTMLElement[]; aggSeg: HTMLElement; count: HTMLElement }> = [];
   private matrixOrder: number[] = [];
   private matrixRowH = 10;
   private matrixTop = 22;
@@ -142,6 +143,12 @@ export class Panels {
       ['wasted', 'Wasted', UI.wasted],
       ['flight', 'In flight'],
     ]);
+    if (this.model?.intermediates) {
+      group('Intermediate aggregates', [
+        ['aggPublished', 'Published by L2s', UI.intermediate],
+        ['aggFetched', 'Fetched by L2s', UI.intermediate],
+      ]);
+    }
   }
 
   private setStat(key: string, value: string): void {
@@ -175,13 +182,18 @@ export class Panels {
         bar.append(seg);
         return seg;
       });
+      // L2s holding this subnet inside another L2's aggregate.
+      const aggSeg = el('i');
+      aggSeg.style.background = heldColor({ via: 'aggregate', prover: -1 }, s, model.subnets, model.provers);
+      aggSeg.style.boxShadow = `inset 0 0 0 1px ${intermediateColor(0.8)}`;
+      bar.append(aggSeg);
       const count = el('span', 'count', `0/${model.l2s.length}`);
       row.append(name, pipsBox, bar, count);
       row.addEventListener('mouseenter', () => this.hooks.hoverSubnet(s));
       row.addEventListener('mouseleave', () => this.hooks.hoverSubnet(-1));
       row.addEventListener('click', () => this.hooks.toggleSubnet(s));
       list.append(row);
-      this.subnetRows.push({ row, pips, bar, segs, count });
+      this.subnetRows.push({ row, pips, bar, segs, aggSeg, count });
     }
   }
 
@@ -202,6 +214,8 @@ export class Panels {
     const pct = counts.rxBytes ? ` (${Math.round((100 * counts.wastedBytes) / counts.rxBytes)}%)` : '';
     this.setStat('wasted', fmtBytes(counts.wastedBytes) + pct);
     this.setStat('flight', String(inFlight));
+    this.setStat('aggPublished', String(counts.aggPublished));
+    this.setStat('aggFetched', String(counts.aggFetched));
 
     const focus = focusSubnet(view);
     model.subnetInfo.forEach((info, s) => {
@@ -219,6 +233,10 @@ export class Panels {
         r.segs[k].style.width = `${(100 * holders) / Math.max(1, l2n)}%`;
         r.segs[k].title = `p${p.prover}: chosen by ${holders} L2`;
       });
+      const viaAgg = countUpTo(info.aggHoldTimes, t);
+      held += viaAgg;
+      r.aggSeg.style.width = `${(100 * viaAgg) / Math.max(1, l2n)}%`;
+      r.aggSeg.title = `held inside another L2's aggregate by ${viaAgg} L2`;
       const text = `${held}/${l2n}`;
       if (r.count.textContent !== text) r.count.textContent = text;
     });
@@ -320,7 +338,6 @@ export class Panels {
     ctx.textAlign = 'left';
     ctx.fillStyle = UI.text3;
     ctx.fillText('merges', width - tailW + 4, 15);
-    const mergesNeeded = Math.max(1, model.subnets - 1);
     this.matrixOrder.forEach((node, row) => {
       const tl = model.l2[node]!;
       const y0 = this.matrixTop + row * this.matrixRowH;
@@ -342,13 +359,18 @@ export class Panels {
         ctx.fillStyle = 'rgba(68,64,60,0.45)';
         ctx.fillRect(x, y0, w, h);
         if (st.kind === 'held') {
-          ctx.fillStyle = proverColor(s, model.subnets, slot.prover, model.provers, dim ? 0.3 : 1);
+          ctx.fillStyle = heldColor(slot, s, model.subnets, model.provers, dim ? 0.3 : 1);
           ctx.fillRect(x, y0, w, h);
         } else if (st.kind === 'fetching') {
           ctx.fillStyle = subnetColor(s, model.subnets, dim ? 0.12 : 0.3);
           ctx.fillRect(x, y0, w, h);
           ctx.fillStyle = subnetColor(s, model.subnets, dim ? 0.3 : 0.9);
           ctx.fillRect(x, y0 + h * (1 - st.progress), w, h * st.progress);
+        }
+        if (st.kind !== 'empty' && slot.via === 'aggregate') {
+          // Top stripe: came inside another L2's aggregate.
+          ctx.fillStyle = intermediateColor(dim ? 0.3 : 0.9);
+          ctx.fillRect(x, y0, w, Math.max(1.5, h * 0.18));
         }
       }
       // Merge progress bar + phase dot.
@@ -361,7 +383,7 @@ export class Panels {
       if (isMerging(tl, t) && phase !== 'aggregated') {
         ctx.fillStyle = `oklch(0.84 0.15 85 / ${0.45 + 0.55 * (0.5 + 0.5 * Math.sin(view.clock / 140))})`;
       }
-      ctx.fillRect(bx, y0 + h * 0.25, (bw * mergesDone(tl, t)) / mergesNeeded, h * 0.5);
+      ctx.fillRect(bx, y0 + h * 0.25, bw * Math.min(1, mergesDone(tl, t) / mergesNeeded(model, tl, t)), h * 0.5);
       ctx.beginPath();
       ctx.arc(width - 8, y0 + h / 2, Math.min(3.5, h / 2), 0, Math.PI * 2);
       ctx.fillStyle = PHASE_COLOR[phase];
@@ -388,7 +410,7 @@ export class Panels {
       if (info.role === 'l2') {
         box.append(el('div', 'detail-stats'));
         const head = el('h3', undefined, 'Aggregation tree');
-        box.append(head, el('p', 'hint small', 'Time runs down. Thin coloured line: fetching the subnet’s proof; dot: held; grey: waiting for a merge; gold bar: a 2→1 recursion.'));
+        box.append(head, el('p', 'hint small', 'Time runs down. Thin coloured line: fetching the subnet’s proof; dot: held; grey: waiting for a merge; gold bar: a 2→1 recursion (ringed: published to other L2s). Ivory column: an intermediate aggregate fetched from another L2.'));
         const canvas = el('canvas', 'tree');
         canvas.id = 'tree';
         box.append(canvas);
@@ -425,12 +447,21 @@ export class Panels {
     const wasted = rx.filter(i => model.transfers[i].layer === 'wasted').reduce((a, i) => a + model.transfers[i].bytes, 0);
     stats.append(
       statLine('Subnets held', `${subnetsHeld(tl, t)}/${model.subnets}`),
-      statLine('2→1 merges', `${mergesDone(tl, t)}/${Math.max(1, model.subnets - 1)}`),
+      statLine('2→1 merges', `${mergesDone(tl, t)}/${mergesNeeded(model, tl, t)}`),
       statLine('All subnets at', fmtTime(tl.allSubnetsAt)),
       statLine('Aggregated at', fmtTime(tl.aggregatedAt)),
       statLine('Received', fmtBytes(rxBytes)),
       statLine('Wasted', `${fmtBytes(wasted)}${rxBytes ? ` (${Math.round((100 * wasted) / rxBytes)}%)` : ''}`),
     );
+    if (model.intermediates) {
+      const dropped = tl.dropped.filter(d => d.t <= t).length;
+      stats.append(
+        statLine('Aggregates published', String(aggregatesPublished(tl, t))),
+        statLine('Aggregates fetched', String(aggregatesFetched(tl, t))),
+        statLine('Aggregates declined', String(tl.aggDeclined)),
+      );
+      if (dropped) stats.append(statLine('Items dropped (subsumed)', String(dropped)));
+    }
     const canvas = box.querySelector<HTMLCanvasElement>('#tree');
     if (canvas) {
       if (tl.merges.some(m => !m.subnets.length)) {
@@ -451,7 +482,9 @@ export class Panels {
       const st = slotState(slot, t, model.chunkCount);
       const chip = `<i class="chip" style="background:${subnetColor(s, model.subnets)}"></i>${s}`;
       const prover = st.kind === 'empty' ? '—'
-        : `<i class="chip" style="background:${proverColor(s, model.subnets, slot.prover, model.provers)}"></i>p${slot.prover}`;
+        : slot.via === 'aggregate'
+          ? `<i class="chip" style="background:${heldColor(slot, s, model.subnets, model.provers)};box-shadow:inset 0 0 0 1px ${intermediateColor()}"></i>agg ${slot.origin >= 0 ? model.nodes[slot.origin].name : ''}`
+          : `<i class="chip" style="background:${proverColor(s, model.subnets, slot.prover, model.provers)}"></i>p${slot.prover}`;
       const held = st.kind === 'held' ? fmtTime(slot.heldAt)
         : st.kind === 'fetching' ? `${Math.round(st.progress * 100)}%` : '—';
       const from = st.kind === 'held' && slot.from >= 0 ? model.nodes[slot.from].name : '';
@@ -477,7 +510,7 @@ export class Panels {
     for (let i = upto - 1; i >= 0 && out.length < 250; i--) {
       const entry = model.logs[i];
       if (node >= 0 && entry.node !== node) continue;
-      if (node < 0 && focus >= 0 && entry.subnet !== focus) continue;
+      if (node < 0 && focus >= 0 && entry.subnet !== focus && !entry.subnets?.includes(focus)) continue;
       out.push(entry);
     }
     list.replaceChildren(...out.map(entry => {
@@ -486,7 +519,8 @@ export class Panels {
       const who = el('span', 'log-node', model.nodes[entry.node].name);
       who.addEventListener('click', () => this.hooks.selectNode(entry.node));
       const chip = el('i', 'chip');
-      chip.style.background = entry.subnet >= 0 ? subnetColor(entry.subnet, model.subnets) : 'transparent';
+      chip.style.background = entry.subnet >= 0 ? subnetColor(entry.subnet, model.subnets)
+        : entry.subnets?.length ? UI.intermediate : 'transparent';
       const text = el('span', 'log-text', entry.text);
       row.append(time, chip, who, text);
       return row;

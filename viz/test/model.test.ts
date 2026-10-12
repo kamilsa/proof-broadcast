@@ -1,8 +1,11 @@
 import { describe, expect, it } from 'vitest';
 import { parseSubnetList, parseTrace } from '../src/model';
 import {
-  activeMerges, activeTransfers, countUpTo, isMerging, l2Phase, mergesDone, networkCounts, slotState, subnetsHeld,
+  activeMerges, activeTransfers, aggregatesFetched, aggregatesPublished, countUpTo, isMerging, l2Phase,
+  mergesDone, mergesNeeded, networkCounts, slotState, subnetsHeld,
 } from '../src/state';
+import { carriesSubnet } from '../src/render';
+import { buildTree } from '../src/tree';
 import { computeLayout, hitNode, hitSector, l2Order, sectorAngles } from '../src/layout';
 
 const header = {
@@ -77,7 +80,9 @@ describe('model', () => {
   });
 
   it('matches merges with their subnet sets', () => {
-    expect(l2.merges).toEqual([{ start: 150000, end: 440000, left: [1], right: [0], subnets: [0, 1] }]);
+    expect(l2.merges).toEqual([{
+      start: 150000, end: 440000, left: [1], right: [0], subnets: [0, 1], published: false, kept: true,
+    }]);
     expect(model.aggregatedTimes).toEqual([440000]);
     expect(model.milestones.map(m => m.label)).toContain('p50 aggregated');
   });
@@ -115,6 +120,96 @@ describe('model', () => {
 
   it('rejects other traces', () => {
     expect(() => parseTrace(JSON.stringify({ ...header, decoderName: 'ec-sim' }))).toThrow(/proof-broadcast/);
+  });
+});
+
+describe('intermediate aggregates', () => {
+  // l2-001 merges {0,1} and publishes it; l2-000 fetches that aggregate,
+  // holds subnet 2 on its own, and needs only one merge.
+  const aggHeader = {
+    ...header,
+    meta: { ...header.meta, subnets: 3, intermediate_proofs: true, intermediate_fetch: 'disjoint' },
+    nodes: [
+      { name: 'l1-s00-p0', props: { role: 'l1', subnet: 0, prover: 0 } },
+      { name: 'l1-s01-p0', props: { role: 'l1', subnet: 1, prover: 0 } },
+      { name: 'l1-s02-p0', props: { role: 'l1', subnet: 2, prover: 0 } },
+      { name: 'l2-000', props: { role: 'l2', l2_index: 0 } },
+      { name: 'l2-001', props: { role: 'l2', l2_index: 1 } },
+    ],
+    edges: [],
+  };
+  const ev = { committees: '0-1', mask: 3, prover: 1 };
+  const aggEvents = [
+    { kind: 'proof_published', t: 0, node: 0, subnet: 0, prover: 0, bytes: 4096 },
+    { kind: 'aggregation_started', t: 10000, node: 4, left_subnets: 0, right_subnets: 1 },
+    { kind: 'aggregation_done', t: 300000, node: 4, subnets: '0-1', kept: true },
+    { kind: 'intermediate_published', t: 300000, node: 4, ...ev, covered: 2 },
+    { kind: 'transfer', t: 300010, arrival: 320000, node: 4, to: 3, bytes: 40, layer: 'announce', subnet: 65535, ...ev },
+    { kind: 'intermediate_committed', t: 320000, node: 3, ...ev, from_node: 4, subsume: false },
+    { kind: 'transfer', t: 330000, arrival: 400000, node: 4, to: 3, bytes: 4100, layer: 'chunk', subnet: 65535, ...ev },
+    { kind: 'intermediate_chunk_received', t: 400000, node: 3, ...ev, from_node: 4, added: 4, dup: 0, held: 4 },
+    { kind: 'intermediate_complete', t: 400000, node: 3, ...ev, from_node: 4, new: '0-1', subnets_done: 2 },
+    { kind: 'proof_committed', t: 350000, node: 3, subnet: 2, prover: 0, from_node: 2 },
+    { kind: 'proof_complete', t: 410000, node: 3, subnet: 2, prover: 0, subnets_done: 3, from_node: 2 },
+    { kind: 'intermediate_declined', t: 420000, node: 3, committees: '1-2', mask: 6, prover: 1, from_node: 4 },
+    { kind: 'aggregation_started', t: 410000, node: 3, left_subnets: 2, right_subnets: '0-1' },
+    { kind: 'aggregation_done', t: 700000, node: 3, subnets: '0-1-2', kept: true },
+    { kind: 'aggregate_complete', t: 700000, node: 3 },
+  ];
+  const model = parseTrace([aggHeader, ...aggEvents].map(x => JSON.stringify(x)).join('\n'));
+  const fetcher = model.l2[3]!;
+  const producer = model.l2[4]!;
+
+  it('marks the producer’s published merge', () => {
+    expect(model.intermediates).toBe(true);
+    expect(producer.merges[0].published).toBe(true);
+    expect(producer.published).toEqual([{ t: 300000, committees: [0, 1] }]);
+  });
+
+  it('fills the fetcher’s slots from the aggregate', () => {
+    expect(fetcher.fetched).toHaveLength(1);
+    const f = fetcher.fetched[0];
+    expect([f.key, f.origin, f.committedAt, f.heldAt, f.from, f.saves]).toEqual(['0-1', 4, 320000, 400000, 4, 1]);
+    for (const s of [0, 1]) {
+      const slot = fetcher.slots[s];
+      expect([slot.via, slot.origin, slot.committedAt, slot.heldAt, slot.prover]).toEqual(['aggregate', 4, 320000, 400000, -1]);
+      expect(slot.chunkSteps).toEqual([[400000, 4]]);
+    }
+    expect(fetcher.slots[2].via).toBe('leaf');
+    expect(slotState(fetcher.slots[0], 350000, 4)).toEqual({ kind: 'fetching', progress: 0 });
+    expect(model.subnetInfo[0].aggHoldTimes).toEqual([400000]);
+    expect(model.subnetInfo[0].heldTimes).toEqual([400000]);
+    expect(fetcher.aggDeclined).toBe(1);
+  });
+
+  it('counts merges against what is left to do', () => {
+    expect(mergesNeeded(model, fetcher, 0)).toBe(2);
+    expect(mergesNeeded(model, fetcher, 500000)).toBe(1);
+    expect(mergesDone(fetcher, 700000)).toBe(1);
+    expect(aggregatesFetched(fetcher, 500000)).toBe(1);
+    expect(aggregatesPublished(producer, 300000)).toBe(1);
+    expect(networkCounts(model, 1e9, 0)).toMatchObject({ aggPublished: 1, aggFetched: 1 });
+  });
+
+  it('tags aggregate transfers with their committees', () => {
+    const tr = model.transfers.find(x => x.layer === 'chunk')!;
+    expect([tr.subnet, tr.prover, tr.committees]).toEqual([-1, 1, [0, 1]]);
+    expect(carriesSubnet(tr, 1)).toBe(true);
+    expect(carriesSubnet(tr, 2)).toBe(false);
+  });
+
+  it('logs aggregate events under every committee', () => {
+    const commit = model.logs.find(l => l.text.startsWith('Fetching aggregate'))!;
+    expect(commit.subnets).toEqual([0, 1]);
+    expect(commit.text).toContain('by l2-001');
+  });
+
+  it('builds the tree with the fetched aggregate as a leaf', () => {
+    const tree = buildTree(model, fetcher);
+    expect(tree.leaves.map(l => l.key).sort()).toEqual(['0-1', '2']);
+    expect(tree.roots).toHaveLength(1);
+    expect(tree.roots[0].subnets).toEqual([0, 1, 2]);
+    expect(tree.missing).toEqual([]);
   });
 });
 

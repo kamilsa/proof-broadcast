@@ -7,16 +7,20 @@ is one event with `t` (and `arrival` for transfers) in microseconds since the
 first L1 publish.
 
 Wire transfers come from the patched gossipsub trace hook (`wire_send` at
-stream write, `wire_recv` at stream read, both tagged with the proof's subnet
-and prover). Sends and receives are matched per (sender, receiver, message
-hash) in order. Each matched transfer is classified from what the receiver
-did with it:
+stream write, `wire_recv` at stream read, both tagged with the proof's subnet,
+prover and committee `mask`). Sends and receives are matched per (sender,
+receiver, message hash) in order. Each matched transfer is classified from
+what the receiver did with it:
 
-- `proof`    whole proof the L2 accepted (first one for its subnet);
+- `proof`    whole proof the L2 accepted (first one for its committees);
 - `chunk`    partial body that added at least one new chunk;
 - `announce` metadata-only partial (an L1/L2 advertising or requesting);
-- `wasted`   whole proof for an already-served subnet, a gossipsub duplicate,
-             or a partial body whose chunks were all already held.
+- `wasted`   whole proof for already-claimed committees, a gossipsub
+             duplicate, or a partial body whose chunks were all already held.
+
+Intermediate aggregates published by L2s (`subnet=65535`, `prover` = the
+L2's index, `mask` = committees) are classified the same way; transfers
+carry `mask` so the viewer can tell them apart.
 
 Usage:
   python3 scripts/export_netviz.py shadow-output [destination.ndjson]
@@ -37,8 +41,27 @@ APP_KINDS = {
     "proof_published", "proof_committed", "proof_declined", "chunk_received",
     "proof_received", "proof_complete", "all_subnets_complete", "aggregation_started",
     "aggregation_done", "aggregate_complete",
+    "intermediate_published", "intermediate_committed", "intermediate_declined",
+    "intermediate_chunk_received", "intermediate_received", "intermediate_complete",
+    "item_dropped",
 }
 DEFAULT_NAME = "proof-broadcast.netviz.ndjson"
+AGGREGATE_SUBNET = 65535  # proof::AGGREGATE_SUBNET
+
+
+def proof_key(ev: dict) -> tuple[int, int, int]:
+    """(subnet, prover, committee mask). Subnet-proof events and older traces
+    carry no mask; a subnet proof's mask is its own subnet's bit."""
+    subnet, prover = int(ev.get("subnet", AGGREGATE_SUBNET)), int(ev.get("prover", -1))
+    mask = ev.get("mask")
+    if mask is None:
+        mask = 1 << subnet if 0 <= subnet < 64 else 0
+    return subnet, prover, int(mask)
+
+
+def committee_list(mask: int) -> str:
+    """`0-3-5` as in the node's event lines (`none` when empty)."""
+    return "-".join(str(s) for s in range(64) if mask >> s & 1) or "none"
 
 
 def parse_rate(value: str) -> float:
@@ -115,14 +138,18 @@ def export(run: Path, output: Path) -> dict[str, int]:
             props["subnet"] = info.get("subnet")
             props["prover"] = info.get("prover")
             props["publish_delay_ms"] = info.get("publish_delay_ms")
+        elif info.get("prover") is not None:
+            # Labels the intermediate aggregates this L2 publishes.
+            props["l2_index"] = info.get("prover")
         nodes.append({"name": name, "props": props})
 
     events: list[dict] = []
     sends: dict[tuple[str, str, str], deque[dict]] = defaultdict(deque)
     receives: list[dict] = []
-    # Receiver-side outcomes used to classify transfers.
-    accepted: set[tuple[int, str, int, int]] = set()          # gossipsub first proof per subnet
-    chunk_outcomes: dict[tuple[int, str, int, int], deque[int]] = defaultdict(deque)
+    # Receiver-side outcomes used to classify transfers, keyed by
+    # (receiver, sender peer, subnet, prover, mask).
+    accepted: set[tuple] = set()          # gossipsub proofs the L2 took
+    chunk_outcomes: dict[tuple, deque[int]] = defaultdict(deque)
 
     for name, path in logs:
         node = index[name]
@@ -140,10 +167,10 @@ def export(run: Path, output: Path) -> dict[str, int]:
                 ev["node"] = node
                 if "from" in ev:
                     ev["from_node"] = index.get(host_of_peer.get(str(ev["from"]), ""), -1)
-                if kind == "proof_received" and not ev.get("redundant"):
-                    accepted.add((node, str(ev["from"]), int(ev["subnet"]), int(ev["prover"])))
-                if kind == "chunk_received":
-                    key = (node, str(ev["from"]), int(ev["subnet"]), int(ev.get("prover", -1)))
+                if kind in ("proof_received", "intermediate_received") and not ev.get("redundant"):
+                    accepted.add((node, str(ev["from"]), *proof_key(ev)))
+                if kind in ("chunk_received", "intermediate_chunk_received"):
+                    key = (node, str(ev["from"]), *proof_key(ev))
                     chunk_outcomes[key].append(int(ev.get("added", 0)))
                 events.append(ev)
 
@@ -161,8 +188,8 @@ def export(run: Path, output: Path) -> dict[str, int]:
             stats["unmatched_receives"] += 1
             continue
         sent = queue.popleft()
-        subnet, prover = int(ev["subnet"]), int(ev["prover"])
-        key = (ev["node"], str(ev["peer"]), subnet, prover)
+        subnet, prover, mask = proof_key(ev)
+        key = (ev["node"], str(ev["peer"]), subnet, prover, mask)
         if "body" not in ev:
             layer = "proof" if key in accepted else "wasted"
             accepted.discard(key)  # later identical copies are duplicates
@@ -176,7 +203,10 @@ def export(run: Path, output: Path) -> dict[str, int]:
         events.append({"kind": "transfer", "node": index[source], "to": ev["node"],
                        "t_us": time_us(sent), "arrival_us": time_us(ev),
                        "bytes": int(ev["bytes"]), "layer": layer,
-                       "subnet": subnet, "prover": prover})
+                       "subnet": subnet, "prover": prover, "mask": mask,
+                       # JS numbers cannot hold a 64-bit mask; the viewer
+                       # reads this list instead.
+                       "committees": committee_list(mask)})
     stats["unmatched_sends"] = sum(map(len, sends.values()))
 
     published = [time_us(e) for e in events if e["kind"] == "proof_published"]

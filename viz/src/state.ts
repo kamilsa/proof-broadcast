@@ -53,10 +53,31 @@ export function activeMerges(tl: L2Timeline, t: number): Merge[] {
   return tl.merges.filter(m => m.start <= t && !(m.end <= t));
 }
 
+/** Finished merges whose result was kept. */
 export function mergesDone(tl: L2Timeline, t: number): number {
   let done = 0;
-  for (const m of tl.merges) if (m.end <= t) done += 1;
+  for (const m of tl.merges) if (m.end <= t && m.kept) done += 1;
   return done;
+}
+
+/** Recursions the L2 needs, as known at t: subnets − 1, less those spared by
+ * aggregates fetched from other L2s. */
+export function mergesNeeded(model: Model, tl: L2Timeline, t: number): number {
+  let saved = 0;
+  for (const f of tl.fetched) if (f.heldAt <= t) saved += f.saves;
+  return Math.max(1, model.subnets - 1 - saved);
+}
+
+export function aggregatesFetched(tl: L2Timeline, t: number): number {
+  let n = 0;
+  for (const f of tl.fetched) if (f.heldAt <= t) n += 1;
+  return n;
+}
+
+export function aggregatesPublished(tl: L2Timeline, t: number): number {
+  let n = 0;
+  for (const p of tl.published) if (p.t <= t) n += 1;
+  return n;
 }
 
 export function subnetsHeld(tl: L2Timeline, t: number): number {
@@ -96,12 +117,15 @@ export interface NetworkCounts {
   rxBytes: number;
   wastedBytes: number;
   inFlight: number;
+  /** Intermediate aggregates published / fetched (held) so far. */
+  aggPublished: number;
+  aggFetched: number;
 }
 
 export function networkCounts(model: Model, t: number, inFlight: number): NetworkCounts {
   const counts: NetworkCounts = {
     l1Published: 0, idle: 0, collecting: 0, merging: 0, all: 0, aggregated: 0,
-    rxBytes: 0, wastedBytes: 0, inFlight,
+    rxBytes: 0, wastedBytes: 0, inFlight, aggPublished: 0, aggFetched: 0,
   };
   for (const info of model.subnetInfo) {
     for (const p of info.provers) if (p.publishedAt <= t) counts.l1Published += 1;
@@ -110,6 +134,8 @@ export function networkCounts(model: Model, t: number, inFlight: number): Networ
     const tl = model.l2[i]!;
     counts[l2Phase(tl, t)] += 1;
     if (isMerging(tl, t)) counts.merging += 1;
+    counts.aggPublished += aggregatesPublished(tl, t);
+    counts.aggFetched += aggregatesFetched(tl, t);
   }
   const k = countUpTo(model.arrivals, t);
   if (k > 0) {

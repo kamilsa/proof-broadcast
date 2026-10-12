@@ -15,7 +15,7 @@ title = "gossipsub-300kib"    # label shown in summary.html
 seed = 42                     # master RNG seed (topology, keypairs, proofs, publish delays)
 runs = 1                      # number of runs; run i uses seed+i
 
-subnets = 16
+subnets = 16                  # at most 64 (committees are a u64 mask)
 provers_per_subnet = 4        # L1 provers per subnet (each publishes a distinct proof)
 l2_provers = 64
 
@@ -28,6 +28,17 @@ publish_grace_secs = 10       # an L1 publishes at most this late while waiting 
 # Each L2 merges pairs as proofs arrive, `aggregation_workers` merges at a time.
 aggregation_ms = 290
 aggregation_workers = 1
+
+# Intermediate proofs (EIP: proof aggregators advertise recursive proofs to
+# each other). When on, every L2 also publishes each aggregate it finishes
+# that covers >= intermediate_min_committees committees (never the final
+# one) on /proofs/1, and fetches other L2s' aggregates per intermediate_fetch:
+#   disjoint  only aggregates sharing no committee with what it holds/fetches
+#   subsume   also aggregates that fully contain some held items (those are
+#             dropped) as long as they add a committee and split no item
+intermediate_proofs = false
+intermediate_min_committees = 2
+intermediate_fetch = "disjoint"   # disjoint | subsume
 
 warmup_secs = 15              # connect + form meshes; the publish epoch follows
 observe_secs = 20             # every node exits at epoch + observe_secs

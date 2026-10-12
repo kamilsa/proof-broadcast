@@ -1,10 +1,12 @@
 // Aggregation tree for one L2, drawn as a time dendrogram: time runs down,
 // one column per subnet. A leaf column shows fetching (thin, subnet colour)
 // then the held proof waiting in the pool (grey); each 2→1 recursion is a gold
-// bar from its start to its end, joined to its two inputs by a bracket.
+// bar from its start to its end, joined to its two inputs by a bracket. An
+// intermediate aggregate fetched from another L2 is a leaf of its own (ivory),
+// covering several subnets.
 
-import type { L2Timeline, Merge, Model } from './model';
-import { UI, proverColor, subnetColor } from './palette';
+import type { FetchedAggregate, L2Timeline, Merge, Model } from './model';
+import { UI, intermediateColor, proverColor, subnetColor } from './palette';
 
 interface Item {
   key: string;
@@ -12,6 +14,8 @@ interface Item {
   /** Leaf: held time. Aggregate: merge end. */
   readyAt: number;
   merge?: Merge;
+  /** Leaf fetched as another L2's aggregate. */
+  fetched?: FetchedAggregate;
   children: Item[];
   parent?: Item;
   x: number;
@@ -37,7 +41,14 @@ export function buildTree(model: Model, tl: L2Timeline): Tree {
     }
     return item;
   };
-  for (let s = 0; s < model.subnets; s++) if (Number.isFinite(tl.slots[s].heldAt)) leaf(s);
+  for (let s = 0; s < model.subnets; s++) {
+    if (Number.isFinite(tl.slots[s].heldAt) && tl.slots[s].via !== 'aggregate') leaf(s);
+  }
+  for (const f of tl.fetched) {
+    if (!Number.isFinite(f.heldAt)) continue;
+    const key = keyOf(f.committees);
+    items.set(key, { key, subnets: f.committees, readyAt: f.heldAt, fetched: f, children: [], x: 0 });
+  }
   const merges = [...tl.merges].sort((a, b) => a.start - b.start);
   for (const merge of merges) {
     const pick = (subnets: number[]) => items.get(keyOf(subnets)) ?? (subnets.length === 1 ? leaf(subnets[0]) : undefined);
@@ -133,9 +144,23 @@ export function drawTree(
     ctx.lineCap = 'butt';
     // Leaf columns: fetch (subnet colour), then held & waiting (grey).
     for (const item of tree.leaves) {
+      const x = item.x;
+      if (item.fetched) {
+        const f = item.fetched;
+        ctx.strokeStyle = intermediateColor(a * 0.8);
+        ctx.lineWidth = 2.5;
+        ctx.beginPath();
+        ctx.moveTo(x, y(f.committedAt));
+        ctx.lineTo(x, y(f.heldAt));
+        ctx.stroke();
+        ctx.beginPath();
+        ctx.arc(x, y(f.heldAt), 4.5, 0, Math.PI * 2);
+        ctx.fillStyle = intermediateColor(a);
+        ctx.fill();
+        continue;
+      }
       const s = item.subnets[0];
       const slot = tl.slots[s];
-      const x = item.x;
       if (Number.isFinite(slot.committedAt)) {
         ctx.strokeStyle = subnetColor(s, model.subnets, a * 0.8);
         ctx.lineWidth = 2;
@@ -163,12 +188,21 @@ export function drawTree(
         joins(child);
       }
       if (item.merge) {
-        ctx.strokeStyle = `oklch(0.84 0.15 85 / ${a})`;
+        const end = Number.isFinite(item.merge.end) ? item.merge.end : t1;
+        // A discarded (subsumed) recursion is drawn faint.
+        ctx.strokeStyle = `oklch(0.84 0.15 85 / ${item.merge.kept ? a : a * 0.3})`;
         ctx.lineWidth = 4;
         ctx.beginPath();
         ctx.moveTo(item.x, y(item.merge.start));
-        ctx.lineTo(item.x, y(Number.isFinite(item.merge.end) ? item.merge.end : t1));
+        ctx.lineTo(item.x, y(end));
         ctx.stroke();
+        if (item.merge.published) {
+          ctx.beginPath();
+          ctx.arc(item.x, y(end), 4.5, 0, Math.PI * 2);
+          ctx.strokeStyle = intermediateColor(a);
+          ctx.lineWidth = 1.5;
+          ctx.stroke();
+        }
       }
     };
     tree.roots.forEach(joins);
@@ -208,6 +242,12 @@ export function drawTree(
   ctx.textAlign = 'center';
   ctx.textBaseline = 'alphabetic';
   tree.leaves.forEach(item => {
+    if (item.fetched) {
+      const label = item.subnets.join(',');
+      ctx.fillStyle = intermediateColor();
+      ctx.fillText(label.length * 6 > colW ? `{${item.subnets.length}}` : label, item.x, top - 8);
+      return;
+    }
     const s = item.subnets[0];
     ctx.fillStyle = subnetColor(s, model.subnets, 1, 0.8);
     ctx.fillText(String(s), item.x, top - 8);

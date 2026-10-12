@@ -2,7 +2,10 @@ import { parseTrace, type Model, type Transfer } from './model';
 import { computeLayout, hitNode, hitSector, l2Order, type L2OrderKey, type Layout } from './layout';
 import { NetworkRenderer, type ColorMode, type ViewState } from './render';
 import { Panels, PHASE_LABEL, fmtBytes, fmtTime } from './panels';
-import { activeTransfers, isMerging, l2Phase, mergesDone, subnetsHeld, countUpTo } from './state';
+import {
+  activeTransfers, aggregatesFetched, aggregatesPublished, countUpTo, isMerging, l2Phase, mergesDone,
+  mergesNeeded, subnetsHeld,
+} from './state';
 import { UI, subnetColor } from './palette';
 
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
@@ -89,6 +92,9 @@ function renderParticleLegend(): void {
       ['oklch(0.80 0.13 175)', 'used (first proof / new chunks)'],
       [UI.wasted, 'wasted (redundant / duplicate)'],
     ];
+  if (model?.intermediates && view.colorMode === 'subnet') {
+    rows.push([UI.intermediate, 'big ivory head: intermediate aggregate (L2 → L2)']);
+  }
   if (view.showAnnounce) rows.push([UI.announce, 'announce / request (metadata)']);
   box.replaceChildren(...rows.map(([color, label]) => {
     const row = document.createElement('div');
@@ -130,9 +136,12 @@ function tooltipHtml(node: number): string {
   }
   const tl = model.l2[node]!;
   const phase = l2Phase(tl, t);
+  const aggs = model.intermediates
+    ? `<br>aggregates: ${aggregatesPublished(tl, t)} published, ${aggregatesFetched(tl, t)} fetched`
+    : '';
   return `<b>${info.name}</b><br>L2 aggregator · ${info.region}<br>${PHASE_LABEL[phase]}${isMerging(tl, t) ? ' · merging' : ''}`
-    + ` · ${subnetsHeld(tl, t)}/${model.subnets} subnets · ${mergesDone(tl, t)}/${Math.max(1, model.subnets - 1)} merges`
-    + `<br>received ${fmtBytes(tl.rxBytes)} total, ${fmtBytes(tl.wastedBytes)} wasted`;
+    + ` · ${subnetsHeld(tl, t)}/${model.subnets} subnets · ${mergesDone(tl, t)}/${mergesNeeded(model, tl, t)} merges`
+    + `<br>received ${fmtBytes(tl.rxBytes)} total, ${fmtBytes(tl.wastedBytes)} wasted${aggs}`;
 }
 
 function updateHover(): void {
@@ -192,6 +201,7 @@ function loadModel(next: Model, name: string): void {
     m.proof_size_kib ? `${m.proof_size_kib} KiB proofs` : '',
     next.mode === 'partial' ? `${next.chunkCount} chunks` : '',
     `2→1 ${next.aggregationMs} ms`,
+    next.intermediates ? `intermediates${m.intermediate_fetch ? ` (${m.intermediate_fetch})` : ''}` : '',
     name,
   ].filter(Boolean).join(' · ');
   scrub.max = String(Math.ceil(next.end));
@@ -204,6 +214,7 @@ function loadModel(next: Model, name: string): void {
   }));
   panels.setModel(next);
   panels.setTab('matrix');
+  renderParticleLegend();
   relayout();
   setTime(0);
   setPlaying(true);

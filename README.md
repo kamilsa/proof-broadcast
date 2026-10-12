@@ -34,6 +34,34 @@ serves the proof it committed to to its mesh. Several holders can answer the
 same request at once. The resulting duplicate chunks are counted
 (`duplicate_chunks`), and no request striping is attempted yet.
 
+## Intermediate proofs
+
+With `intermediate_proofs = true`, L2s also share their partial aggregates, as
+the EIP's proof aggregators do on `recursive_aggregation`. Works in both modes.
+
+- **Publishing**: when a 2→1 recursion finishes with a result covering at
+  least `intermediate_min_committees` committees (default 2), the L2 publishes
+  it on `/proofs/1`. The final aggregate (all committees) is never published.
+  An aggregate is the same size as a subnet proof.
+- **Identity**: a proof covers a committee bitmask (`subnets <= 64`). The group
+  id / gossip message carries `subnet || prover || committees`. Aggregates
+  use `subnet = 65535` and `prover` = the producing L2's index (`l2-NNN`).
+- **Fetching** (`intermediate_fetch`): an L2 never holds two proofs covering
+  the same committee.
+  - `disjoint`: fetch only proofs whose committees are disjoint from
+    everything it holds, is merging or is downloading.
+  - `subsume`: also fetch a proof that fully contains some held items, as long
+    as it adds a new committee and splits no held item or running merge, and
+    overlaps no download (partial-message requests cannot be withdrawn). The
+    contained items are frozen until it arrives, then dropped
+    (`item_dropped`). A merge still running then is discarded when it ends.
+- A fetched aggregate enters the L2's pool like a subnet proof, so the L2 runs
+  fewer recursions (`merges_run`, `subnets − 1` without intermediates).
+
+Fetching only pays off when proofs arrive slowly relative to the merge time
+(bandwidth-bound links). On localhost every L2 holds every subnet proof long
+before any aggregate appears, so aggregates are only declined.
+
 ## Run
 
 ```text
@@ -91,6 +119,12 @@ pick.
     each 2→1 recursion, taken from the logged merge subnets) and its per-subnet
     table.
   - **Log**: filtered by the current selection.
+- **Intermediate proofs**: aggregates exchanged between L2s are ivory particles
+  with a larger head. A subnet held inside a fetched aggregate is a darker,
+  outlined donut segment (an ivory stripe in the matrix, an `agg l2-NNN` row
+  in the subnet table). In the tree a fetched aggregate is an ivory leaf
+  column, and a published merge is ringed in ivory. The merge count is out of
+  the merges still needed after fetches.
 
 Keys: Space play/pause, ←/→ step 50 ms (Shift: 500 ms), Home restart, Esc clear.
 
@@ -126,8 +160,17 @@ automatically from the header.
 `proof_published`, `proof_received` (gossipsub, `redundant=`),
 `proof_committed` / `proof_declined` / `chunk_received` (partial),
 `proof_complete`, `all_subnets_complete`, `aggregation_started`
-(`left_subnets=0-3 right_subnets=5`), `aggregation_done` (`subnets=0-3-5`),
-`aggregate_complete`, `bytes`, `run_end`.
+(`left_subnets=0-3 right_subnets=5`), `aggregation_done` (`subnets=0-3-5
+kept=`), `aggregate_complete`, `bytes`, `run_end`.
+
+Intermediate proofs add `intermediate_published`, `intermediate_received`
+(gossipsub, `redundant= subsume=`), `intermediate_committed` (`subsume=`) /
+`intermediate_declined` / `intermediate_chunk_received` (partial),
+`intermediate_complete` (`new=` committees it added) and `item_dropped`. Each
+carries `committees=0-1-5 mask=<u64> prover=<L2 index> hash=`. `run_end` adds
+`intermediates_published`, `intermediates_fetched`, `intermediates_declined`,
+`merges_run`, `merges_discarded` and `items_dropped`. Wire events
+(`wire_send` / `wire_recv`) carry `mask=` too.
 
 ## Tests
 

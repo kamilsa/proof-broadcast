@@ -18,7 +18,23 @@ export const UI = {
   wasted: 'oklch(0.70 0.18 35)',
   announce: 'oklch(0.60 0.02 260)',
   useful: 'oklch(0.78 0.14 175)',
+  /** Intermediate aggregates exchanged between L2s. */
+  intermediate: 'oklch(0.93 0.04 95)',
 } as const;
+
+export function intermediateColor(alpha = 1): string {
+  return `oklch(0.93 0.04 95 / ${alpha})`;
+}
+
+/** A held subnet: the chosen prover's shade, or a darker shade of the subnet
+ * when it arrived inside another L2's aggregate. */
+export function heldColor(
+  slot: { via: string; prover: number }, subnet: number, subnets: number, provers: number, alpha = 1,
+): string {
+  return slot.via === 'aggregate'
+    ? subnetColor(subnet, subnets, alpha, 0.52)
+    : proverColor(subnet, subnets, slot.prover, provers, alpha);
+}
 
 export function subnetHue(subnet: number, subnets: number): number {
   return (20 + (subnet * 360) / Math.max(1, subnets)) % 360;
