@@ -19,18 +19,20 @@ use tokio::time::{self, Duration, Instant};
 use tracing::{info, warn};
 
 use crate::aggregation::{Aggregator, Step, Subnets, subnet_list};
+use crate::chunked_mode::{ChunkMessage, ChunkedProof, ChunkedState, chunk_messages};
 use crate::event;
 use crate::gossip_mode::ProofMessage;
 use crate::network::{
     GossipTuning, MeshTuning, SimBehaviour, SimBehaviourEvent, build_swarm, dial_peers,
-    gossip_byte_totals, mesh_peer_count, proofs_topic, subscribe_partial, topic_peer_count,
+    gossip_byte_totals, mesh_peer_count, proofs_chunked_topic, proofs_topic, subscribe_partial,
+    topic_peer_count,
 };
 use crate::partial_mode::{
     CellBitmap, ChunkBody, OutgoingProof, PartialState, PartsMetadata, ProofAssembly,
 };
 use crate::proof::{
-    CoverageLedger, FetchPolicy, MAX_CHUNKS, MAX_SUBNETS, ProofId, Verdict, make_aggregate,
-    make_proof, mask_of, split, subnets_of,
+    Committees, CoverageLedger, FetchPolicy, MAX_CHUNKS, MAX_SUBNETS, ProofId, Verdict,
+    make_aggregate, make_proof, mask_of, split, subnets_of,
 };
 
 /// Propagation protocol.
@@ -40,6 +42,9 @@ pub enum Mode {
     Gossipsub,
     /// Chunked proofs via gossipsub 1.3 partial messages.
     Partial,
+    /// Every proof chunk as its own gossipsub message on `/proofs_chunked/1`.
+    #[value(name = "gossipsub-chunked")]
+    GossipsubChunked,
 }
 
 impl std::fmt::Display for Mode {
@@ -47,6 +52,7 @@ impl std::fmt::Display for Mode {
         f.write_str(match self {
             Self::Gossipsub => "gossipsub",
             Self::Partial => "partial",
+            Self::GossipsubChunked => "gossipsub-chunked",
         })
     }
 }
@@ -112,9 +118,15 @@ pub struct Cli {
     #[arg(long, default_value_t = 300)]
     pub proof_size_kib: usize,
 
-    /// Chunks per proof in `partial` mode.
+    /// Chunks per proof in `partial` and `gossipsub-chunked` modes.
     #[arg(long, default_value_t = 64)]
     pub chunk_count: usize,
+
+    /// `gossipsub-chunked`: after each new chunk, also send IDONTWANT for it
+    /// to every mesh peer (as ec-sim). Gossipsub already sends IDONTWANT on
+    /// receipt for messages above 1000 bytes.
+    #[arg(long, default_value_t = false)]
+    pub chunked_send_idontwant: bool,
 
     /// L1 publish delay after the warmup epoch.
     #[arg(long, default_value_t = 0)]
@@ -264,6 +276,16 @@ pub struct NodeReport {
     pub merges_discarded: usize,
     /// Held items dropped for a subsuming aggregate.
     pub items_dropped: usize,
+    /// `gossipsub-chunked`: chunks received, and those of proofs not relayed.
+    pub chunks_received: usize,
+    pub chunks_ignored: usize,
+    /// `gossipsub-chunked`: fully received proofs that were not used (their
+    /// committees were already covered).
+    pub proofs_unused: usize,
+    /// `gossipsub-chunked`: proofs used although they were not relayed.
+    pub used_unrelayed: usize,
+    /// `gossipsub-chunked`: explicit IDONTWANT messages sent (peer count).
+    pub idontwant_sent: usize,
     pub tx_bytes: u64,
     pub rx_bytes: u64,
 }
@@ -279,6 +301,7 @@ struct Node {
     aggregator: Aggregator,
     jobs: FuturesUnordered<JobFuture>,
     partial: PartialState,
+    chunked: ChunkedState,
     report: NodeReport,
 }
 
@@ -315,6 +338,16 @@ impl Node {
                     .publish_partial(self.topic.hash(), outgoing)
                     .map(|_| ())
                     .map_err(|e| e.to_string())
+            }
+            Mode::GossipsubChunked => {
+                let gossipsub = &mut self.swarm.behaviour_mut().gossipsub;
+                let mut failed = None;
+                for chunk in chunk_messages(&id, &proof) {
+                    if let Err(err) = gossipsub.publish(self.topic.clone(), chunk.encode()) {
+                        failed.get_or_insert(err.to_string());
+                    }
+                }
+                failed.map_or(Ok(()), Err)
             }
         }
     }
@@ -385,6 +418,12 @@ impl Node {
         let Some(new) = self.ledger.complete(id) else {
             return;
         };
+        self.use_proof(id, from, new, true);
+    }
+
+    /// `id` is fully held and goes into the aggregation pool. `new` are the
+    /// committees it newly covers; `relayed` whether we also forward it.
+    fn use_proof(&mut self, id: &ProofId, from: PeerId, new: Committees, relayed: bool) {
         let now = self.elapsed_ms();
         self.report.first_proof_ms.get_or_insert(now);
         self.report.subnets_done = self.ledger.subnets_done();
@@ -399,7 +438,8 @@ impl Node {
                 hash = id.label(),
                 from = from,
                 new = subnet_list(&subnets_of(new)),
-                subnets_done = self.report.subnets_done
+                subnets_done = self.report.subnets_done,
+                relayed = relayed
             );
         } else {
             event!(
@@ -408,7 +448,8 @@ impl Node {
                 prover = id.prover,
                 hash = id.label(),
                 from = from,
-                subnets_done = self.report.subnets_done
+                subnets_done = self.report.subnets_done,
+                relayed = relayed
             );
         }
         if self.ledger.all_done() && self.report.all_subnets_ms.is_none() {
@@ -560,6 +601,193 @@ impl Node {
         if !redundant {
             self.proof_complete(&id, source);
         }
+    }
+
+    // ── L2: gossipsub-chunked ───────────────────────────────────────────
+
+    fn on_chunk(&mut self, source: PeerId, message_id: gossipsub::MessageId, data: &[u8]) {
+        let validate = |node: &mut Self, acceptance| {
+            node.swarm
+                .behaviour_mut()
+                .gossipsub
+                .report_message_validation_result(&message_id, &source, acceptance);
+        };
+        let Some((chunk, id)) = ChunkMessage::decode(data)
+            .ok()
+            .and_then(|chunk| chunk.id().map(|id| (chunk, id)))
+        else {
+            validate(self, MessageAcceptance::Reject);
+            return;
+        };
+        // The first chunk of a proof decides whether it is relayed: only if
+        // no other proof covering its committees was seen before.
+        let relay = match self.chunked.proofs.get(&id.hash) {
+            Some(proof) => proof.relay,
+            None => {
+                let relay = self.first_chunk(&id, source);
+                self.chunked.proofs.insert(
+                    id.hash,
+                    ChunkedProof {
+                        assembly: ProofAssembly::new(id),
+                        relay,
+                    },
+                );
+                relay
+            }
+        };
+        validate(
+            self,
+            if relay { MessageAcceptance::Accept } else { MessageAcceptance::Ignore },
+        );
+        let proof = self.chunked.proofs.get_mut(&id.hash).expect("inserted above");
+        let out = proof.assembly.merge_one(chunk.index as usize, &chunk.data);
+        if out.added == 0 {
+            return;
+        }
+        self.report.chunks_received += 1;
+        if !relay {
+            self.report.chunks_ignored += 1;
+        }
+        if self.cli.chunked_send_idontwant {
+            self.report.idontwant_sent += self
+                .swarm
+                .behaviour_mut()
+                .gossipsub
+                .send_idontwant_to_mesh(self.topic.hash(), [message_id.clone()]);
+        }
+        if id.is_aggregate() {
+            event!(
+                "intermediate_chunk_received",
+                committees = subnet_list(&id.subnets()),
+                mask = id.committees,
+                prover = id.prover,
+                hash = id.label(),
+                from = source,
+                index = chunk.index,
+                added = out.added,
+                dup = out.duplicate,
+                held = out.held,
+                relayed = relay
+            );
+        } else {
+            event!(
+                "chunk_received",
+                subnet = id.subnet,
+                prover = id.prover,
+                hash = id.label(),
+                from = source,
+                index = chunk.index,
+                added = out.added,
+                dup = out.duplicate,
+                held = out.held,
+                relayed = relay
+            );
+        }
+        if out.invalid {
+            event!("proof_invalid", subnet = id.subnet, mask = id.committees, hash = id.label());
+        }
+        if out.completed.is_some() {
+            self.chunked_proof_complete(&id, source, relay);
+        }
+    }
+
+    /// Relay decision for a proof seen for the first time.
+    fn first_chunk(&mut self, id: &ProofId, from: PeerId) -> bool {
+        let verdict = self.verdict(id);
+        match verdict {
+            Verdict::Free | Verdict::Subsume => {
+                self.ledger.commit(id);
+                self.report.committed = self.committed();
+                if id.is_aggregate() {
+                    event!(
+                        "intermediate_committed",
+                        committees = subnet_list(&id.subnets()),
+                        mask = id.committees,
+                        covered = id.covered(),
+                        prover = id.prover,
+                        hash = id.label(),
+                        from = from,
+                        peer_chunks = 1,
+                        subsume = verdict == Verdict::Subsume
+                    );
+                } else {
+                    event!(
+                        "proof_committed",
+                        subnet = id.subnet,
+                        prover = id.prover,
+                        hash = id.label(),
+                        from = from,
+                        peer_chunks = 1
+                    );
+                }
+                true
+            }
+            Verdict::Mine => false,
+            Verdict::Taken => {
+                if self.decline(id) {
+                    if id.is_aggregate() {
+                        event!(
+                            "intermediate_declined",
+                            committees = subnet_list(&id.subnets()),
+                            mask = id.committees,
+                            covered = id.covered(),
+                            prover = id.prover,
+                            hash = id.label(),
+                            from = from
+                        );
+                    } else {
+                        event!(
+                            "proof_declined",
+                            subnet = id.subnet,
+                            prover = id.prover,
+                            hash = id.label(),
+                            from = from
+                        );
+                    }
+                }
+                false
+            }
+        }
+    }
+
+    /// A proof is fully received (relayed or not). The first complete proof
+    /// covering committees we still need is used; the rest are counted.
+    fn chunked_proof_complete(&mut self, id: &ProofId, from: PeerId, relayed: bool) {
+        let subsume = self.cli.intermediate_fetch == FetchPolicy::Subsume;
+        let fit = self.aggregator.fits(id.committees, subsume);
+        let new = fit.and_then(|_| self.ledger.adopt(id));
+        let Some(new) = new else {
+            self.report.proofs_unused += 1;
+            if id.is_aggregate() {
+                event!(
+                    "intermediate_unused",
+                    committees = subnet_list(&id.subnets()),
+                    mask = id.committees,
+                    prover = id.prover,
+                    hash = id.label(),
+                    from = from,
+                    relayed = relayed
+                );
+            } else {
+                event!(
+                    "proof_unused",
+                    subnet = id.subnet,
+                    prover = id.prover,
+                    hash = id.label(),
+                    from = from,
+                    relayed = relayed
+                );
+            }
+            return;
+        };
+        if !relayed {
+            self.report.used_unrelayed += 1;
+        }
+        if fit == Some(true) {
+            // Drop the held items this proof contains when it joins the pool.
+            self.aggregator.reserve(id.committees);
+        }
+        self.use_proof(id, from, new, relayed);
     }
 
     // ── L2: partial messages ────────────────────────────────────────────
@@ -728,7 +956,11 @@ impl Node {
                 message_id,
                 message,
             })) if message.topic == self.topic.hash() => {
-                self.on_message(propagation_source, message_id, &message.data);
+                if self.cli.mode == Mode::GossipsubChunked {
+                    self.on_chunk(propagation_source, message_id, &message.data);
+                } else {
+                    self.on_message(propagation_source, message_id, &message.data);
+                }
             }
             SwarmEvent::Behaviour(SimBehaviourEvent::Gossipsub(gossipsub::Event::Partial {
                 topic_hash,
@@ -762,7 +994,12 @@ impl Node {
             intermediates_declined = self.report.intermediates_declined,
             merges_run = self.report.merges_run,
             merges_discarded = self.report.merges_discarded,
-            items_dropped = self.report.items_dropped
+            items_dropped = self.report.items_dropped,
+            chunks_received = self.report.chunks_received,
+            chunks_ignored = self.report.chunks_ignored,
+            proofs_unused = self.report.proofs_unused,
+            used_unrelayed = self.report.used_unrelayed,
+            idontwant_sent = self.report.idontwant_sent
         );
     }
 }
@@ -784,9 +1021,12 @@ pub async fn run(cli: Cli) -> NodeReport {
     let (mut swarm, local_peer_id) = build_swarm(cli.seed, &cli.listen_ip, cli.listen_port, &tuning);
     info!(%local_peer_id, "swarm built");
 
-    let topic = proofs_topic();
+    let topic = match cli.mode {
+        Mode::GossipsubChunked => proofs_chunked_topic(),
+        Mode::Gossipsub | Mode::Partial => proofs_topic(),
+    };
     match (cli.role, cli.mode) {
-        (Role::L2, Mode::Gossipsub) => {
+        (Role::L2, Mode::Gossipsub | Mode::GossipsubChunked) => {
             swarm
                 .behaviour_mut()
                 .gossipsub
@@ -800,7 +1040,7 @@ pub async fn run(cli: Cli) -> NodeReport {
             .behaviour_mut()
             .gossipsub
             .enable_partials_for_topic(topic.hash(), false),
-        (Role::L1, Mode::Gossipsub) => {}
+        (Role::L1, Mode::Gossipsub | Mode::GossipsubChunked) => {}
     }
     dial_peers(&mut swarm, &cli.peers);
 
@@ -823,6 +1063,7 @@ pub async fn run(cli: Cli) -> NodeReport {
         aggregator: Aggregator::new(subnets, workers),
         jobs: FuturesUnordered::new(),
         partial: PartialState::default(),
+        chunked: ChunkedState::default(),
         report: NodeReport::default(),
     };
 

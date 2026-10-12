@@ -20,6 +20,13 @@ pub fn proofs_topic() -> IdentTopic {
     IdentTopic::new(TOPIC_PROOFS)
 }
 
+/// `gossipsub-chunked` mode: one gossipsub message per proof chunk.
+pub const TOPIC_PROOFS_CHUNKED: &str = "/proofs_chunked/1";
+
+pub fn proofs_chunked_topic() -> IdentTopic {
+    IdentTopic::new(TOPIC_PROOFS_CHUNKED)
+}
+
 #[derive(NetworkBehaviour)]
 pub struct SimBehaviour {
     pub gossipsub: gossipsub::Behaviour,

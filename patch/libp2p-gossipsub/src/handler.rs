@@ -92,17 +92,27 @@ const MAX_SUBSTREAM_ATTEMPTS: usize = 5;
 // committees: u64, .. }`; a partial's group id is `0x03 || subnet u16 ||
 // prover u16 || committees u64 || ..` (all LE). `subnet=65535` marks an L2's
 // intermediate aggregate, `mask=` is its committee bitmask. Partials also
-// report `body=` (chunk bytes; 0 = metadata-only announcement).
+// report `body=` (chunk bytes; 0 = metadata-only announcement). On
+// `/proofs_chunked/1` each message is one bincode `ChunkMessage { subnet,
+// prover, committees, index: u16, .. }`, tagged with `index=` too.
 const PROOFS_TOPIC: &str = "/proofs/1";
+const PROOFS_CHUNKED_TOPIC: &str = "/proofs_chunked/1";
 
 fn proof_tag(topic: &str, head: &[u8]) -> String {
-    match head.get(..12) {
-        Some(b) if topic == PROOFS_TOPIC => format!(
+    let fields = |b: &[u8]| {
+        format!(
             " subnet={} prover={} mask={}",
             u16::from_le_bytes([b[0], b[1]]),
             u16::from_le_bytes([b[2], b[3]]),
             u64::from_le_bytes(b[4..12].try_into().expect("8 bytes"))
-        ),
+        )
+    };
+    match topic {
+        PROOFS_TOPIC => head.get(..12).map(fields).unwrap_or_default(),
+        PROOFS_CHUNKED_TOPIC => head
+            .get(..14)
+            .map(|b| format!("{} index={}", fields(b), u16::from_le_bytes([b[12], b[13]])))
+            .unwrap_or_default(),
         _ => String::new(),
     }
 }

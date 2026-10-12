@@ -182,6 +182,24 @@ impl Aggregator {
             .collect()
     }
 
+    /// Whether a complete proof covering `mask` can join the pool now:
+    /// `Some(false)` if disjoint from every live unit, `Some(true)` if
+    /// `subsume` is allowed and it fully contains the units it overlaps while
+    /// adding a committee (call [`reserve`](Self::reserve) before adding it,
+    /// so those units are dropped), `None` otherwise.
+    pub fn fits(&self, mask: Committees, subsume: bool) -> Option<bool> {
+        if self.complete {
+            return None;
+        }
+        let units = self.units();
+        let claimed = units.iter().fold(0, |m, u| m | u);
+        if mask & claimed == 0 {
+            return Some(false);
+        }
+        let contains = mask & !claimed != 0 && units.iter().all(|&u| u & mask == 0 || u & !mask == 0);
+        (subsume && contains).then_some(true)
+    }
+
     pub fn is_complete(&self) -> bool {
         self.complete
     }
@@ -327,6 +345,27 @@ mod tests {
         assert_eq!(dropped, vec![vec![0, 1], vec![2], vec![3]]);
         assert_eq!(step.jobs.len(), 1);
         assert_eq!(step.jobs[0].merged(), vec![0, 1, 2, 3, 5]);
+    }
+
+    #[test]
+    fn fits_checks_live_units() {
+        let mut agg = Aggregator::new(8, 1);
+        agg.add_leaf(0);
+        agg.add_leaf(1); // running {0,1}
+        agg.add_leaf(4);
+        assert_eq!(agg.fits(0b1100, false), Some(false));
+        assert_eq!(agg.fits(0b0011, false), None);
+        // {0,1,2} contains the running {0,1} and adds 2.
+        assert_eq!(agg.fits(0b0111, true), Some(true));
+        // {1,2} splits {0,1}; {0,1} adds nothing.
+        assert_eq!(agg.fits(0b0110, true), None);
+        assert_eq!(agg.fits(0b0011, true), None);
+        // Use it: the running {0,1} is discarded, {4} stays.
+        agg.reserve(0b0111);
+        let step = agg.add_item(vec![0, 1, 2]);
+        assert!(step.dropped.is_empty());
+        assert_eq!(agg.units(), vec![0b10000, 0b0111]);
+        assert!(!agg.job_done(vec![0, 1]).kept);
     }
 
     #[test]

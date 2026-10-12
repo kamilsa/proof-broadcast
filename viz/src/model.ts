@@ -44,6 +44,9 @@ export interface SubnetSlot {
   heldAt: number;
   /** Prover whose proof the L2 chose (−1 until chosen, or via an aggregate). */
   prover: number;
+  /** gossipsub-chunked: the prover whose chunks the L2 relays (the first it
+   * saw); the proof it uses (`prover`) is whichever completes first. */
+  relayProver: number;
   /** Node that delivered the final part of the proof. */
   from: number;
   /** Whether the subnet came in its own proof or inside a fetched aggregate. */
@@ -198,7 +201,7 @@ export function parseSubnetList(v: unknown): number[] {
 
 function emptySlot(): SubnetSlot {
   return {
-    committedAt: NaN, heldAt: NaN, prover: -1, from: -1, via: '', origin: -1, aggKey: '',
+    committedAt: NaN, heldAt: NaN, prover: -1, relayProver: -1, from: -1, via: '', origin: -1, aggKey: '',
     chunkSteps: [], declined: 0, redundant: 0, wastedBytes: 0, usefulBytes: 0,
   };
 }
@@ -292,6 +295,8 @@ export function buildModel(
   const logs: LogEntry[] = [];
   const publishTimes: number[] = [];
   const pending: Array<Merge | undefined>[] = nodes.map(() => []);
+  /** gossipsub-chunked: chunks held per `node:subnet`, per prover. */
+  const chunkHeld = new Map<string, Map<number, number>>();
   const log = (t: number, node: number, subnet: number, kind: string, text: string, list?: number[]) =>
     logs.push(list ? { t, node, subnet, subnets: list, kind, text } : { t, node, subnet, kind, text });
   const tag = (ev: RawEvent) => `S${num(ev.subnet)}·p${num(ev.prover)}`;
@@ -358,6 +363,7 @@ export function buildModel(
         if (slot && Number.isNaN(slot.committedAt)) {
           slot.committedAt = t;
           slot.prover = num(ev.prover);
+          slot.relayProver = num(ev.prover);
           slot.via = 'leaf';
         }
         log(t, node, subnet, 'commit', `Fetching ${tag(ev)} from ${nameOf(ev.from_node)}`);
@@ -367,6 +373,21 @@ export function buildModel(
         log(t, node, subnet, 'decline', `Declined ${tag(ev)} — S${subnet} already chosen`);
         break;
       case 'chunk_received':
+        if (ev.index !== undefined) {
+          // gossipsub-chunked: one event per chunk, for every prover's proof.
+          // Progress is the best proof's; logged only via commit / complete.
+          if (slot && slot.via !== 'aggregate') {
+            const key = `${node}:${subnet}`;
+            const held = chunkHeld.get(key) ?? new Map<number, number>();
+            chunkHeld.set(key, held);
+            held.set(num(ev.prover), num(ev.held));
+            const best = Math.max(...held.values());
+            const last = slot.chunkSteps.at(-1);
+            if (!last || best > last[1]) slot.chunkSteps.push([t, best]);
+            if (Number.isNaN(slot.committedAt)) slot.committedAt = t;
+          }
+          break;
+        }
         if (slot && slot.via !== 'aggregate' && slot.prover === num(ev.prover, slot.prover)) {
           const held = num(ev.held);
           const last = slot.chunkSteps.at(-1);
@@ -399,7 +420,13 @@ export function buildModel(
           subnetInfo[subnet].heldTimes.push(t);
           proverInfo(subnet, slot.prover)?.holdTimes.push(t);
         }
-        log(t, node, subnet, 'held', `Holds ${tag(ev)} — ${num(ev.subnets_done)}/${subnets} subnets`);
+        log(t, node, subnet, 'held', `Holds ${tag(ev)}${ev.relayed === false ? ' (not the one it relays)' : ''} — ${num(ev.subnets_done)}/${subnets} subnets`);
+        break;
+      case 'proof_unused':
+        log(t, node, subnet, 'dup', `Assembled ${tag(ev)} but S${subnet} is already held — unused`);
+        break;
+      case 'intermediate_unused':
+        log(t, node, -1, 'dup', `Assembled aggregate ${aggTag(ev, committeesOf(ev))} but it overlaps what it holds — unused`, committeesOf(ev));
         break;
       case 'all_subnets_complete':
         if (timeline) timeline.allSubnetsAt = t;
@@ -472,6 +499,7 @@ export function buildModel(
             if (!last || held > last[1]) own.chunkSteps.push([t, held]);
           }
         }
+        if (ev.index !== undefined) break; // gossipsub-chunked: one event per chunk
         log(t, node, -1, num(ev.added) > 0 ? 'chunk' : 'dup',
           `Chunks of aggregate {${list.join(',')}} from ${nameOf(ev.from_node)}: +${num(ev.added)} new, ${num(ev.dup)} dup (${num(ev.held)}/${chunkCount})`, list);
         break;

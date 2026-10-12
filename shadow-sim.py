@@ -48,7 +48,7 @@ BIN_DOCKER = f"/opt/proofsim/{BIN_NAME}"
 BIN_NATIVE = str(REPO_ROOT / "target" / "release" / BIN_NAME)
 STDOUT_NAME = f"{BIN_NAME}.1000.stdout"
 
-MODES = {"gossipsub", "partial"}
+MODES = {"gossipsub", "partial", "gossipsub-chunked"}
 DEFAULT_MODE = "gossipsub"
 # Keep in sync with the clap defaults in src/node.rs.
 DEFAULT_SUBNETS = 16
@@ -66,6 +66,7 @@ DEFAULT_INTERMEDIATE_PROOFS = False
 DEFAULT_INTERMEDIATE_MIN_COMMITTEES = 2
 FETCH_POLICIES = {"disjoint", "subsume"}
 DEFAULT_INTERMEDIATE_FETCH = "disjoint"
+DEFAULT_CHUNKED_SEND_IDONTWANT = False
 DEFAULT_WARMUP_SECS = 15
 DEFAULT_OBSERVE_SECS = 20
 DEFAULT_FLOOD_PUBLISH = False
@@ -168,6 +169,9 @@ def prover_settings(sim: dict) -> dict:
         "aggregation_workers": _positive_int(sim, "aggregation_workers",
                                              DEFAULT_AGGREGATION_WORKERS),
         **intermediate_settings(sim),
+        # gossipsub-chunked: extra IDONTWANT to mesh peers after each new chunk.
+        "chunked_send_idontwant": bool(sim.get("chunked_send_idontwant",
+                                               DEFAULT_CHUNKED_SEND_IDONTWANT)),
         "warmup_secs": _nonneg_int(sim, "warmup_secs", DEFAULT_WARMUP_SECS),
         "observe_secs": _nonneg_int(sim, "observe_secs", DEFAULT_OBSERVE_SECS),
     }
@@ -359,6 +363,8 @@ def build_args(node: Node, cfg: dict, peers: list[str]) -> str:
             parts += ["--intermediate-proofs",
                       "--intermediate-min-committees", str(p["intermediate_min_committees"]),
                       "--intermediate-fetch", p["intermediate_fetch"]]
+    if mode_setting(sim) == "gossipsub-chunked" and p["chunked_send_idontwant"]:
+        parts.append("--chunked-send-idontwant")
     flood, lazy, factor = gossip_tuning_settings(sim)
     if flood:
         parts.append("--flood-publish")
@@ -520,7 +526,7 @@ def summarize(out_dir: Path) -> None:
         log(f"no shadow.data/hosts under {out_dir} — nothing to summarize.")
         return
     counts = {"hosts": 0, "published": 0, "l2": 0, "all_subnets": 0, "aggregated": 0,
-              "intermediates": 0, "fetched": 0}
+              "intermediates": 0, "fetched": 0, "unrelayed": 0}
     for host in sorted(hosts_dir.iterdir()):
         stdout = host / STDOUT_NAME
         if not stdout.is_file():
@@ -535,6 +541,9 @@ def summarize(out_dir: Path) -> None:
             counts["aggregated"] += "EVENT kind=aggregate_complete" in text
             counts["intermediates"] += text.count("EVENT kind=intermediate_published")
             counts["fetched"] += text.count("EVENT kind=intermediate_complete")
+            counts["unrelayed"] += sum(1 for line in text.splitlines()
+                                       if "EVENT kind=proof_complete" in line
+                                       and "relayed=false" in line)
     log("── run summary ─────────────────────────────────────────────")
     log(f"hosts: {counts['hosts']}  L1 published: {counts['published']}")
     log(f"L2 collected all subnets: {counts['all_subnets']}/{counts['l2']}  "
@@ -542,6 +551,8 @@ def summarize(out_dir: Path) -> None:
     if counts["intermediates"]:
         log(f"intermediate aggregates published: {counts['intermediates']}  "
             f"fetched: {counts['fetched']}")
+    if counts["unrelayed"]:
+        log(f"subnet proofs used without being relayed: {counts['unrelayed']}")
     log("────────────────────────────────────────────────────────────")
 
 

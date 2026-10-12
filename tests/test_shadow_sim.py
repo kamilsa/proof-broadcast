@@ -116,6 +116,17 @@ class ArgsTests(unittest.TestCase):
         # L1 provers never publish aggregates.
         self.assertNotIn("--intermediate", shadow_sim.build_args(nodes[0], cfg, []))
 
+    def test_gossipsub_chunked_mode_and_idontwant_flag(self) -> None:
+        node = shadow_sim.Node(9, "l2-000", "l2")
+        args = shadow_sim.build_args(node, small_cfg(mode="gossipsub-chunked"), [])
+        self.assertIn("--mode gossipsub-chunked", args)
+        self.assertNotIn("--chunked-send-idontwant", args)
+        cfg = small_cfg(mode="gossipsub-chunked", chunked_send_idontwant=True)
+        self.assertIn("--chunked-send-idontwant", shadow_sim.build_args(node, cfg, []))
+        # The flag only applies to the chunked mode.
+        cfg = small_cfg(mode="gossipsub", chunked_send_idontwant=True)
+        self.assertNotIn("--chunked-send-idontwant", shadow_sim.build_args(node, cfg, []))
+
     def test_intermediate_settings_defaults(self) -> None:
         p = shadow_sim.prover_settings(small_cfg()["sim"])
         self.assertEqual((p["intermediate_proofs"], p["intermediate_min_committees"],
@@ -231,6 +242,29 @@ class AnalyzeTests(unittest.TestCase):
             analyze.write_html([run], root / "summary.html")
             self.assertIn("+int (disjoint)", (root / "summary.html").read_text())
 
+    def test_chunked_metrics(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "run-meta.json").write_text(json.dumps(
+                {"mode": "gossipsub-chunked", "seed": 1, "run_index": 0, "subnets": 1,
+                 "proof_size_kib": 1, "chunked_send_idontwant": True}))
+            write_host(root, "l1-s00-p0", [
+                "EVENT kind=proof_published t_ms=1000 subnet=0 prover=0 hash=aa"])
+            for name, ignored in (("l2-000", 64), ("l2-001", 0)):
+                write_host(root, name, [
+                    "EVENT kind=run_end t_ms=9000 role=l2 chunks_received=128 "
+                    f"chunks_ignored={ignored} proofs_unused=1 used_unrelayed=1 "
+                    "idontwant_sent=40"])
+            run = analyze.collect_run(root)
+            self.assertTrue(run["chunked"])
+            self.assertEqual(run["chunks_received_median"], 128)
+            self.assertEqual(run["chunks_ignored_median"], 32)
+            self.assertEqual(run["used_unrelayed_total"], 2)
+            self.assertEqual(run["idontwant_sent_median"], 40)
+            analyze.print_summary(run)
+            analyze.write_html([run], root / "summary.html")
+            self.assertIn("gossipsub-chunked +idontwant", (root / "summary.html").read_text())
+
     def test_parse_event_line(self) -> None:
         ev = analyze.parse_event_line(
             "\x1b[32m INFO\x1b[0m event: EVENT kind=run_end t_ms=5 aggregated=true n=3 x=NA")
@@ -301,6 +335,45 @@ class ExportNetvizTests(unittest.TestCase):
             self.assertNotIn("from", committed)
             self.assertEqual(transfers[0]["mask"], 1)
             self.assertEqual(transfers[0]["committees"], "0")
+
+    def test_classifies_gossipsub_chunked_transfers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.write_run(root)
+            # Replace the logs: l1 publishes chunks of its proof; l2-000 gets
+            # chunk 0 from l1 (useful), the same chunk again from l2-001
+            # (duplicate), and a chunk of l2-001's aggregate it never used.
+            topic = "topic=/proofs_chunked/1"
+            leaf = f"{topic} subnet=0 prover=0 mask=1"
+            agg = f"{topic} subnet=65535 prover=1 mask=3"
+            write = lambda name, lines: (  # noqa: E731
+                root / f"shadow.data/hosts/{name}/proof-broadcast.1000.stdout").write_text(
+                "\n".join(lines) + "\n")
+            write("l1-s00-p0", [
+                "EVENT kind=proof_published t_ms=1000 t_us=1000000 subnet=0 prover=0 hash=aa",
+                f"EVENT kind=wire_send t_ms=1000 t_us=1000010 peer=P1 id=c0 {leaf} index=0 bytes=100",
+            ])
+            write("l2-001", [
+                f"EVENT kind=wire_send t_ms=1100 t_us=1100000 peer=P1 id=c0 {leaf} index=0 bytes=100",
+                f"EVENT kind=wire_send t_ms=1200 t_us=1200000 peer=P1 id=a0 {agg} index=0 bytes=100",
+            ])
+            write("l2-000", [
+                f"EVENT kind=wire_recv t_ms=1050 t_us=1050000 peer=P0 id=c0 {leaf} index=0 bytes=100",
+                "EVENT kind=chunk_received t_ms=1050 t_us=1050010 subnet=0 prover=0 from=P0 "
+                "index=0 added=1 dup=0 held=1 relayed=true",
+                "EVENT kind=proof_complete t_ms=1050 t_us=1050020 subnet=0 prover=0 from=P0 relayed=true",
+                f"EVENT kind=wire_recv t_ms=1150 t_us=1150000 peer=P2 id=c0 {leaf} index=0 bytes=100",
+                f"EVENT kind=wire_recv t_ms=1250 t_us=1250000 peer=P2 id=a0 {agg} index=0 bytes=100",
+                "EVENT kind=intermediate_unused t_ms=1250 t_us=1250010 committees=0-1 mask=3 "
+                "prover=1 from=P2 relayed=false",
+            ])
+            out = root / "trace.ndjson"
+            export_netviz.export(root, out)
+            events = [json.loads(line) for line in out.read_text().splitlines()[1:]]
+            transfers = [e for e in events if e["kind"] == "transfer"]
+            self.assertEqual([(t["node"], t["to"], t["layer"]) for t in transfers],
+                             [(0, 1, "chunk"), (2, 1, "wasted"), (2, 1, "wasted")])
+            self.assertIn("intermediate_unused", {e["kind"] for e in events})
 
     def test_classifies_intermediate_transfers(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

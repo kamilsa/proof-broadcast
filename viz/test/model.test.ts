@@ -213,6 +213,45 @@ describe('intermediate aggregates', () => {
   });
 });
 
+describe('gossipsub-chunked', () => {
+  // l2-000 relays S0·p0 (first chunk seen) but S0·p1 completes first and is
+  // the one it uses; p0's last chunk arrives later and is unused.
+  const chunkedHeader = {
+    ...header,
+    meta: { ...header.meta, mode: 'gossipsub-chunked', subnets: 1, chunk_count: 2 },
+    nodes: header.nodes.slice(0, 2).concat([{ name: 'l2-000', props: { role: 'l2', country: 'asia' } }]),
+    edges: [],
+  };
+  const chunk = (t: number, prover: number, index: number, held: number, relayed: boolean) => ({
+    kind: 'chunk_received', t, node: 2, subnet: 0, prover, index, added: 1, dup: 0, held, relayed, from_node: prover,
+  });
+  const chunkedEvents = [
+    { kind: 'proof_published', t: 0, node: 0, subnet: 0, prover: 0, bytes: 4096 },
+    { kind: 'proof_committed', t: 100, node: 2, subnet: 0, prover: 0, from_node: 0 },
+    chunk(100, 0, 0, 1, true),
+    { kind: 'proof_declined', t: 200, node: 2, subnet: 0, prover: 1, from_node: 1 },
+    chunk(200, 1, 0, 1, false),
+    chunk(300, 1, 1, 2, false),
+    { kind: 'proof_complete', t: 300, node: 2, subnet: 0, prover: 1, from_node: 1, subnets_done: 1, relayed: false },
+    chunk(400, 0, 1, 2, true),
+    { kind: 'proof_unused', t: 400, node: 2, subnet: 0, prover: 0, from_node: 0, relayed: true },
+  ];
+  const model = parseTrace([chunkedHeader, ...chunkedEvents].map(x => JSON.stringify(x)).join('\n'));
+  const slot = model.l2[2]!.slots[0];
+
+  it('separates the relayed prover from the used one', () => {
+    expect([slot.relayProver, slot.prover, slot.heldAt, slot.declined]).toEqual([0, 1, 300, 1]);
+  });
+
+  it('tracks the best proof’s chunk progress without logging every chunk', () => {
+    expect(slot.chunkSteps).toEqual([[100, 1], [300, 2]]);
+    expect(slotState(slot, 250, 2)).toEqual({ kind: 'fetching', progress: 0.5 });
+    const kinds = model.logs.map(l => l.text.split(' ')[0]);
+    expect(kinds).toEqual(['Published', 'Fetching', 'Declined', 'Holds', 'Assembled']);
+    expect(model.logs.find(l => l.kind === 'held')!.text).toContain('not the one it relays');
+  });
+});
+
 describe('layout', () => {
   const model = parseTrace(text);
   const order = l2Order(model, 'finish');

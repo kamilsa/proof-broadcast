@@ -18,7 +18,7 @@ static NEXT_PORT: AtomicU16 = AtomicU16::new(0);
 fn base_port() -> u16 {
     // Give each network its own port block; offset by pid for parallel runs.
     let block = NEXT_PORT.fetch_add(1, Ordering::SeqCst);
-    30_000 + (std::process::id() % 400) as u16 * 60 + block * 15
+    30_000 + (std::process::id() % 100) as u16 * 250 + block * 15
 }
 
 fn addr(port: u16) -> String {
@@ -146,6 +146,46 @@ async fn partial_mode_delivers_one_proof_per_subnet() {
     }
 }
 
+fn check_chunked(label: &str, subnets: usize, l2: &[NodeReport]) {
+    for (i, r) in l2.iter().enumerate() {
+        eprintln!(
+            "{label} L2 {i}: chunks={} ignored={} unused={} used_unrelayed={} idontwant={}",
+            r.chunks_received, r.chunks_ignored, r.proofs_unused, r.used_unrelayed, r.idontwant_sent
+        );
+        // Every used proof arrived chunk by chunk (16 chunks per proof).
+        assert!(r.chunks_received >= subnets * 16, "{label}: L2 {i} got chunks: {r:?}");
+        assert!(r.chunks_ignored <= r.chunks_received);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn gossipsub_chunked_mode_delivers_one_proof_per_subnet() {
+    let (l1, l2) = run_network(Mode::GossipsubChunked, 2, &[]).await;
+    check("gossipsub-chunked", 2, &l1, &l2);
+    check_plain(Mode::GossipsubChunked, &l2);
+    check_chunked("gossipsub-chunked", 2, &l2);
+    assert!(l2.iter().all(|r| r.idontwant_sent == 0));
+    for r in &l1 {
+        assert_eq!(r.subnets_done, 0);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn gossipsub_chunked_mode_sends_idontwant_when_asked() {
+    let (l1, l2) = run_network(Mode::GossipsubChunked, 2, &["--chunked-send-idontwant"]).await;
+    check("gossipsub-chunked+idontwant", 2, &l1, &l2);
+    check_chunked("gossipsub-chunked+idontwant", 2, &l2);
+    assert!(l2.iter().all(|r| r.idontwant_sent > 0));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn gossipsub_chunked_mode_with_intermediate_proofs() {
+    let (l1, l2) = run_network(Mode::GossipsubChunked, 4, &["--intermediate-proofs"]).await;
+    check("gossipsub-chunked+intermediate", 4, &l1, &l2);
+    check_intermediates("gossipsub-chunked+intermediate", &l2);
+    check_chunked("gossipsub-chunked+intermediate", 4, &l2);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn gossipsub_mode_with_intermediate_proofs() {
     let (l1, l2) = run_network(Mode::Gossipsub, 4, &["--intermediate-proofs"]).await;
@@ -265,6 +305,12 @@ const MISSED_BOTH: [u64; 4] = [0, 0, 3500, 3500];
 async fn gossipsub_late_l2_fetches_intermediate_aggregate() {
     let (late, l2) = run_late_joiner(Mode::Gossipsub, MISSED_BOTH, 4300, &[]).await;
     check_late_joiner("gossipsub", &late, &l2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn gossipsub_chunked_late_l2_fetches_intermediate_aggregate() {
+    let (late, l2) = run_late_joiner(Mode::GossipsubChunked, MISSED_BOTH, 4300, &[]).await;
+    check_late_joiner("gossipsub-chunked", &late, &l2);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

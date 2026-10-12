@@ -145,15 +145,28 @@ impl ProofId {
         let u16_at = |i: usize| u16::from_le_bytes([bytes[i], bytes[i + 1]]);
         let committees = u64::from_le_bytes(bytes[5..13].try_into().ok()?);
         let proof_len = u32::from_le_bytes(bytes[13..17].try_into().ok()?);
-        let chunk_count = u16_at(17);
-        if chunk_count == 0 || chunk_count as usize > MAX_CHUNKS {
-            return None;
-        }
         let mut hash = [0u8; 32];
         hash.copy_from_slice(&bytes[19..51]);
+        Self::from_header(u16_at(1), u16_at(3), committees, proof_len, u16_at(17), hash)
+    }
+
+    /// Identity from untrusted header fields (a group id or a chunk), or
+    /// `None` if the mask or the chunk layout is inconsistent.
+    pub fn from_header(
+        subnet: u16,
+        prover: u16,
+        committees: Committees,
+        proof_len: u32,
+        chunk_count: u16,
+        hash: [u8; 32],
+    ) -> Option<Self> {
+        let chunks = chunk_count as usize;
+        if chunks == 0 || chunks > MAX_CHUNKS || chunks > (proof_len as usize).max(1) {
+            return None;
+        }
         let id = Self {
-            subnet: u16_at(1),
-            prover: u16_at(3),
+            subnet,
+            prover,
             committees,
             proof_len,
             chunk_count,
@@ -392,6 +405,34 @@ impl CoverageLedger {
         Some(new)
     }
 
+    /// `gossipsub-chunked`: a fully received proof is used, whether or not
+    /// it was claimed (relayed) — the first complete proof of a subnet wins.
+    /// Returns the committees it newly covers, or `None` if it was already
+    /// held or is our own.
+    pub fn adopt(&mut self, id: &ProofId) -> Option<Committees> {
+        if self.own.contains(&id.hash) {
+            return None;
+        }
+        if self.claims.contains_key(&id.hash) {
+            return self.complete(id);
+        }
+        self.claims.insert(
+            id.hash,
+            Claim {
+                committees: id.committees,
+                state: ClaimState::Held,
+            },
+        );
+        for s in id.subnets() {
+            if let Some(slot @ None) = self.committed.get_mut(s as usize) {
+                *slot = Some(id.hash);
+            }
+        }
+        let new = id.committees & !self.held;
+        self.held |= id.committees;
+        Some(new)
+    }
+
     /// Record a declined proof; true the first time this hash is declined.
     pub fn decline(&mut self, id: &ProofId) -> bool {
         self.declined.insert(id.hash)
@@ -570,6 +611,24 @@ mod tests {
         assert_eq!(ledger.complete(&a), Some(0b1100));
         assert_eq!(ledger.committed(2), Some(a.hash));
         assert_eq!(ledger.verdict(&agg(2, &[3, 4]), &[0b1, 0b1100]), Verdict::Taken);
+    }
+
+    #[test]
+    fn adopt_unclaimed_and_claimed_proofs() {
+        let mut ledger = CoverageLedger::new(4, FetchPolicy::Disjoint);
+        let relayed = id(0, 0);
+        let other = id(0, 1);
+        ledger.commit(&relayed);
+        // The unrelayed proof of subnet 0 completes first and is used.
+        assert_eq!(ledger.adopt(&other), Some(0b1));
+        assert_eq!(ledger.adopt(&other), None);
+        assert_eq!(ledger.committed(0), Some(relayed.hash));
+        // The relayed one completing later adds nothing new.
+        assert_eq!(ledger.adopt(&relayed), Some(0));
+        let a = agg(1, &[1, 2]);
+        ledger.own(&a);
+        assert_eq!(ledger.adopt(&a), None);
+        assert_eq!(ledger.subnets_done(), 1);
     }
 
     #[test]

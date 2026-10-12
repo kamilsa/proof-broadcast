@@ -28,6 +28,15 @@ UX and the same patched gossipsub (partial messages, per-topic byte counters).
 |---|---|---|
 | `gossipsub` | Whole proof as one gossipsub message on `/proofs/1` | Accept (forward) the first proof per subnet; later ones are *Ignored* (not forwarded), but they were already downloaded |
 | `partial` | Gossipsub 1.3 partial messages; proof split into `chunk_count` chunks (default 64) | Group id = `ProofId` (subnet, prover, size, chunks, hash). The L1 advertises a have-bitmap. An L2 commits to the first proof per subnet that a peer holds chunks of, and requests all chunks. It never requests a second proof from that subnet |
+| `gossipsub-chunked` | Each of the `chunk_count` chunks is its own gossipsub message on `/proofs_chunked/1` (as ec-sim's mode of the same name) | The first chunk of a proof decides: relay (Accept) its chunks only if no other proof of that subnet was seen before; otherwise Ignore (not forwarded, but still received). The L2 uses whichever proof of the subnet completes first, relayed or not |
+
+In `gossipsub-chunked` mode, an L2 relays the chunks of only one proof per
+subnet but receives and assembles the chunks of every proof its peers relay.
+`proof_complete relayed=false` marks a used proof the L2 does not relay;
+proofs that complete after their subnet is covered are `proof_unused`.
+`chunked_send_idontwant = true` additionally sends IDONTWANT to every mesh
+peer after each new chunk (as ec-sim). Gossipsub already sends IDONTWANT on
+receipt for messages over 1000 bytes.
 
 In `partial` mode an L2 advertises the chunks it holds as they arrive, so it
 serves the proof it committed to to its mesh. Several holders can answer the
@@ -172,9 +181,17 @@ carries `committees=0-1-5 mask=<u64> prover=<L2 index> hash=`. `run_end` adds
 `merges_run`, `merges_discarded` and `items_dropped`. Wire events
 (`wire_send` / `wire_recv`) carry `mask=` too.
 
+`gossipsub-chunked` emits `proof_committed` / `proof_declined` on a proof's
+first chunk (relay or not), one `chunk_received` per chunk (`index= held=
+relayed=`), `proof_complete relayed=` for the proof used, and `proof_unused`
+(`intermediate_*` equivalents for aggregates). `run_end` adds
+`chunks_received`, `chunks_ignored` (chunks of proofs not relayed),
+`proofs_unused`, `used_unrelayed` and `idontwant_sent`. Wire events on
+`/proofs_chunked/1` carry `index=`.
+
 ## Tests
 
 ```text
-cargo test                              # unit + in-process QUIC end-to-end (both modes)
+cargo test                              # unit + in-process QUIC end-to-end (all modes)
 python3 -m unittest tests/test_shadow_sim.py
 ```

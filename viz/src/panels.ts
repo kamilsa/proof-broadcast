@@ -476,15 +476,18 @@ export class Panels {
       const tr = model.transfers[i];
       if (tr.layer === 'wasted' && tr.subnet >= 0 && tr.subnet < model.subnets) wastedBySubnet[tr.subnet] += tr.bytes;
     }
-    const declinedLabel = model.mode === 'partial' ? 'declined' : 'redundant';
-    const rows: string[] = [`<tr><th>S</th><th>prover</th><th>from</th><th>held</th><th>wasted</th><th title="Other proofs of this subnet turned down (partial) or received anyway (gossipsub), whole run">${declinedLabel}</th></tr>`];
+    const declinedLabel = model.mode === 'gossipsub' ? 'redundant' : 'declined';
+    const rows: string[] = [`<tr><th>S</th><th>prover</th><th>from</th><th>held</th><th>wasted</th><th title="Other proofs of this subnet turned down (partial), not relayed (gossipsub-chunked) or received anyway (gossipsub), whole run">${declinedLabel}</th></tr>`];
     tl.slots.forEach((slot, s) => {
       const st = slotState(slot, t, model.chunkCount);
       const chip = `<i class="chip" style="background:${subnetColor(s, model.subnets)}"></i>${s}`;
       const prover = st.kind === 'empty' ? '—'
         : slot.via === 'aggregate'
           ? `<i class="chip" style="background:${heldColor(slot, s, model.subnets, model.provers)};box-shadow:inset 0 0 0 1px ${intermediateColor()}"></i>agg ${slot.origin >= 0 ? model.nodes[slot.origin].name : ''}`
-          : `<i class="chip" style="background:${proverColor(s, model.subnets, slot.prover, model.provers)}"></i>p${slot.prover}`;
+          : `<i class="chip" style="background:${proverColor(s, model.subnets, slot.prover, model.provers)}"></i>p${slot.prover}`
+            + (st.kind === 'held' && slot.relayProver >= 0 && slot.relayProver !== slot.prover
+              ? ` <span class="muted" title="Relays the first proof it saw; uses the first that completed">(relays p${slot.relayProver})</span>`
+              : '');
       const held = st.kind === 'held' ? fmtTime(slot.heldAt)
         : st.kind === 'fetching' ? `${Math.round(st.progress * 100)}%` : '—';
       const from = st.kind === 'held' && slot.from >= 0 ? model.nodes[slot.from].name : '';

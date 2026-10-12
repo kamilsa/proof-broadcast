@@ -85,7 +85,8 @@ def _med(values: list) -> float | None:
 RUN_END_COUNTERS = ("redundant_proofs", "duplicate_chunks", "declined",
                     "intermediates_published", "intermediates_fetched",
                     "intermediates_declined", "merges_run", "merges_discarded",
-                    "items_dropped")
+                    "items_dropped", "chunks_received", "chunks_ignored", "proofs_unused",
+                    "used_unrelayed", "idontwant_sent")
 
 
 def collect_run(run_dir: Path) -> dict:
@@ -201,6 +202,13 @@ def collect_run(run_dir: Path) -> dict:
         "merges_run_median": _med(counter("merges_run")),
         "merges_discarded_total": sum(counter("merges_discarded")),
         "items_dropped_total": sum(counter("items_dropped")),
+        # gossipsub-chunked: per-chunk relay decisions.
+        "chunked": meta.get("mode") == "gossipsub-chunked",
+        "chunks_received_median": _med(counter("chunks_received")),
+        "chunks_ignored_median": _med(counter("chunks_ignored")),
+        "proofs_unused_median": _med(counter("proofs_unused")),
+        "used_unrelayed_total": sum(counter("used_unrelayed")),
+        "idontwant_sent_median": _med(counter("idontwant_sent")),
         "hosts": {n: {k: h[k] for k in ("role", "sent", "rcvd", "all_subnets_ms",
                                          "aggregate_ms")} for n, h in hosts.items()},
     }
@@ -235,6 +243,13 @@ def print_summary(run: dict) -> None:
     print(f"   per L2 (median): redundant proofs {run['redundant_proofs_median']}, "
           f"duplicate chunks {run['duplicate_chunks_median']}, "
           f"declined {run['declined_median']};  distinct proofs used per subnet: {pps}")
+    if run.get("chunked"):
+        print(f"   chunks/L2 (median): received {run['chunks_received_median']}, "
+              f"of unrelayed proofs {run['chunks_ignored_median']};  "
+              f"assembled but unused proofs/L2 {run['proofs_unused_median']};  "
+              f"proofs used without relaying them: {run['used_unrelayed_total']}"
+              + (f";  IDONTWANT sent/L2 {run['idontwant_sent_median']}"
+                 if run.get("meta", {}).get("chunked_send_idontwant") else ""))
     if run.get("intermediate_proofs"):
         print(f"   intermediates ({run.get('intermediate_fetch')}): "
               f"published {run['intermediates_published_total']}, "
@@ -332,7 +347,8 @@ def write_html(runs: list[dict], out_path: Path) -> None:
             ("L2 rx", "l2_rx_median"), ("redundancy", "redundancy"),
             ("dup chunks", "duplicate_chunks_median"), ("proofs/subnet", "proofs_per_subnet"),
             ("aggs fetched/L2", "intermediates_fetched_median"),
-            ("merges/L2", "merges_run_median")]
+            ("merges/L2", "merges_run_median"),
+            ("unrelayed chunks/L2", "chunks_ignored_median")]
     rows = []
     series_agg, series_col = [], []
     for i, run in enumerate(runs):
@@ -341,6 +357,8 @@ def write_html(runs: list[dict], out_path: Path) -> None:
         series_agg.append((label, color, run.get("agg_delays_ms") or [], run["n_l2"]))
         series_col.append((label, color, run.get("col_delays_ms") or [], run["n_l2"]))
         mode = str(run.get("mode"))
+        if run.get("chunked") and run.get("meta", {}).get("chunked_send_idontwant"):
+            mode += " +idontwant"
         if run.get("intermediate_proofs"):
             mode += f" +int ({run.get('intermediate_fetch')})"
         cells = [f'<span class="sw" style="background:{color}"></span>{escape(run["label"])}',
@@ -355,6 +373,8 @@ def write_html(runs: list[dict], out_path: Path) -> None:
             elif key in ("duplicate_chunks_median", "intermediates_fetched_median",
                          "merges_run_median"):
                 cells.append("NA" if v is None else f"{v:g}")
+            elif key == "chunks_ignored_median":
+                cells.append(f"{v:g}" if run.get("chunked") and v is not None else "—")
             else:
                 cells.append(_ms(v))
         rows.append("<tr>" + "".join(f"<td>{c}</td>" for c in cells) + "</tr>")
@@ -389,7 +409,9 @@ Times are relative to the first L1 publish. "agg tail" is the median time from
 holding every subnet to finishing the aggregate. "redundancy" is the median L2 rx
 over subnets × proof size. With intermediate proofs ("+int"), L2s also publish
 their partial aggregates; "aggs fetched/L2" is how many each L2 used instead of
-recursing itself, and "merges/L2" the 2→1 recursions it ran (subnets − 1 without).</p>
+recursing itself, and "merges/L2" the 2→1 recursions it ran (subnets − 1 without).
+In gossipsub-chunked mode an L2 relays only the first proof it sees per subnet but
+receives the chunks of every other one; "unrelayed chunks/L2" counts those.</p>
 <div class="wrap"><table><thead><tr>{head}</tr></thead><tbody>{"".join(rows)}</tbody></table></div>
 <div class="charts">
 <div>{svg_cdf(series_agg, "L2 aggregate complete (CDF)")}</div>

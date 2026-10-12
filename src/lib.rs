@@ -1,12 +1,14 @@
 //! Shadow-compatible simulator for leanVM proof propagation.
 //!
 //! L1 provers (one per `(subnet, prover)`) each publish a proof; L2 provers
-//! collect one proof per subnet and aggregate them with 2→1 recursion. Two
-//! transports are compared: whole proofs over gossipsub, and chunked proofs
-//! over gossipsub 1.3 partial messages. Optionally, L2 provers also publish
-//! their intermediate aggregates for other L2s to fetch.
+//! collect one proof per subnet and aggregate them with 2→1 recursion. Three
+//! transports are compared: whole proofs over gossipsub, chunked proofs over
+//! gossipsub 1.3 partial messages, and chunks as plain gossipsub messages.
+//! Optionally, L2 provers also publish their intermediate aggregates for
+//! other L2s to fetch.
 
 pub mod aggregation;
+pub mod chunked_mode;
 pub mod events;
 pub mod gossip_mode;
 pub mod network;

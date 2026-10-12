@@ -22,6 +22,10 @@ Intermediate aggregates published by L2s (`subnet=65535`, `prover` = the
 L2's index, `mask` = committees) are classified the same way; transfers
 carry `mask` so the viewer can tell them apart.
 
+`gossipsub-chunked` messages (topic `/proofs_chunked/1`, tagged `index=`)
+are `chunk` if it is the receiver's first copy of that chunk and the receiver
+used that proof (it completed first for its committees), else `wasted`.
+
 Usage:
   python3 scripts/export_netviz.py shadow-output [destination.ndjson]
 """
@@ -43,7 +47,7 @@ APP_KINDS = {
     "aggregation_done", "aggregate_complete",
     "intermediate_published", "intermediate_committed", "intermediate_declined",
     "intermediate_chunk_received", "intermediate_received", "intermediate_complete",
-    "item_dropped",
+    "item_dropped", "proof_unused", "intermediate_unused",
 }
 DEFAULT_NAME = "proof-broadcast.netviz.ndjson"
 AGGREGATE_SUBNET = 65535  # proof::AGGREGATE_SUBNET
@@ -150,6 +154,8 @@ def export(run: Path, output: Path) -> dict[str, int]:
     # (receiver, sender peer, subnet, prover, mask).
     accepted: set[tuple] = set()          # gossipsub proofs the L2 took
     chunk_outcomes: dict[tuple, deque[int]] = defaultdict(deque)
+    used: set[tuple] = set()              # (receiver, subnet, prover, mask) it used
+    seen_chunks: set[tuple] = set()       # gossipsub-chunked copies already received
 
     for name, path in logs:
         node = index[name]
@@ -169,9 +175,11 @@ def export(run: Path, output: Path) -> dict[str, int]:
                     ev["from_node"] = index.get(host_of_peer.get(str(ev["from"]), ""), -1)
                 if kind in ("proof_received", "intermediate_received") and not ev.get("redundant"):
                     accepted.add((node, str(ev["from"]), *proof_key(ev)))
-                if kind in ("chunk_received", "intermediate_chunk_received"):
+                if kind in ("chunk_received", "intermediate_chunk_received") and "index" not in ev:
                     key = (node, str(ev["from"]), *proof_key(ev))
                     chunk_outcomes[key].append(int(ev.get("added", 0)))
+                if kind in ("proof_complete", "intermediate_complete"):
+                    used.add((node, *proof_key(ev)))
                 events.append(ev)
 
     for queue in sends.values():
@@ -190,7 +198,12 @@ def export(run: Path, output: Path) -> dict[str, int]:
         sent = queue.popleft()
         subnet, prover, mask = proof_key(ev)
         key = (ev["node"], str(ev["peer"]), subnet, prover, mask)
-        if "body" not in ev:
+        if "index" in ev:
+            copy = (ev["node"], subnet, prover, mask, int(ev["index"]))
+            first = copy not in seen_chunks
+            seen_chunks.add(copy)
+            layer = "chunk" if first and (ev["node"], subnet, prover, mask) in used else "wasted"
+        elif "body" not in ev:
             layer = "proof" if key in accepted else "wasted"
             accepted.discard(key)  # later identical copies are duplicates
         elif int(ev["body"]) == 0:

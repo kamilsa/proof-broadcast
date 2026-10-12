@@ -396,11 +396,20 @@ impl ProofAssembly {
     }
 
     pub fn merge(&mut self, body: &ChunkBody) -> MergeOutcome {
+        self.merge_chunks(body.iter().map(|(idx, chunk)| (idx, chunk.as_slice())))
+    }
+
+    /// Merge one chunk (`gossipsub-chunked` mode).
+    pub fn merge_one(&mut self, idx: usize, chunk: &[u8]) -> MergeOutcome {
+        self.merge_chunks(std::iter::once((idx, chunk)))
+    }
+
+    fn merge_chunks<'a>(&mut self, chunks: impl Iterator<Item = (usize, &'a [u8])>) -> MergeOutcome {
         let mut out = MergeOutcome::default();
-        for (idx, chunk) in body.iter() {
+        for (idx, chunk) in chunks {
             match self.chunks.get_mut(idx) {
                 Some(slot @ None) => {
-                    *slot = Some(Arc::new(chunk.clone()));
+                    *slot = Some(Arc::new(chunk.to_vec()));
                     out.added += 1;
                 }
                 Some(Some(_)) => out.duplicate += 1,
