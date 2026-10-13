@@ -1,0 +1,9 @@
+[project]
+name = "proof-broadcast-tree"
+version = "0.1.0"
+description = "Shadow launcher + analyzer for the leanVM proof-aggregation-tree simulator"
+requires-python = ">=3.11"
+dependencies = []
+
+[tool.uv]
+package = false

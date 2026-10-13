@@ -1,0 +1,91 @@
+# proofsim.toml — configuration for `uv run shadow-sim.py`.
+#
+# 16 subnets x 4 L1 provers produce one leanVM proof each. 64 L2 aggregators
+# are spread over a 2->1 aggregation tree (8 + 4 + 2 + 1 = 15 tree nodes),
+# each at the node its PeerId hashes to. A tree node merges its inputs with
+# one recursion and hands the result to its parent's aggregators; the root's
+# aggregate is the global proof.
+
+[run]
+# "docker" builds an image (proof-broadcast-tree on top of [docker].shadow_image)
+#          and runs Shadow in a container — zero local setup beyond Docker.
+# "native" builds with `cargo build --release` and runs `shadow` from PATH (Linux).
+runner = "native"
+
+[sim]
+title = "tree-2to1"           # label shown in summary.html
+seed = 42                     # master RNG seed (topology, keypairs, proofs, publish delays)
+runs = 1                      # number of runs; run i uses seed+i
+
+subnets = 16                  # 2..64 (committees are a u64 mask)
+provers_per_subnet = 4        # L1 provers per subnet (each produces a distinct proof)
+l2_provers = 64               # aggregators; must be >= the number of tree nodes
+
+proof_size_kib = 300
+chunk_count = 64              # chunks per proof (the unit of a pull request)
+proof_jitter_ms = 500         # each L1 publishes at epoch + uniform[0, jitter] (seeded)
+
+# Tree fan-in: every tree node merges up to `aggregation_arity` inputs in one
+# k->1 recursion taking `aggregation_ms` whatever its input count. 2->1 is
+# leanVM's README figure (0.287 s, M4 Max, log-inv-rate 2). For 4->1 a
+# longer recursion is realistic, e.g. aggregation_arity = 4, aggregation_ms = 600.
+aggregation_arity = 2
+aggregation_ms = 290
+
+# Chunk pull: at most this many chunk requests outstanding to one peer (64 =
+# a whole proof pipelined from one holder), and the per-request timeout.
+max_inflight_per_peer = 64
+request_timeout_ms = 10000
+
+# Every proof (complete, or still arriving: chunks are relayed as they land)
+# is announced and served to at most `fanout` peers at a time; a slot frees
+# when that peer holds the proof, declines it or disconnects. Chunk-progress
+# announcements to those peers are batched over `have_interval_ms`.
+fanout = 8
+have_interval_ms = 10
+
+warmup_secs = 15              # connect + handshake; the publish epoch follows
+observe_secs = 20             # every node exits at epoch + observe_secs
+
+rust_log = "info"
+# stop_time = "90s"           # optional; default = warmup_secs + observe_secs + 30s
+
+[topology]
+# Peers are dialed along the tree (connections are two-way):
+l1_peers_per_node = 4         # an L1 dials this many aggregators of the node consuming its subnet
+tree_mates_per_node = 8       # an L2 dials this many aggregators of its own tree node
+tree_parent_peers = 4         # ... and this many of its parent node
+
+[network]
+jitter_ratio = 0.3
+packet_loss = 0.0
+
+[network.l1]                  # EIP-7870 home staker
+bandwidth_up = "25 Mbit"
+bandwidth_down = "50 Mbit"
+
+[network.l2]
+bandwidth_up = "25 Mbit"
+bandwidth_down = "50 Mbit"
+
+# [network.l2_supernodes]     # optional: a seeded fraction of L2s gets this bandwidth
+# fraction = 0.5              # ([network.l1_supernodes] does the same for L1s)
+# bandwidth_up = "1 Gbit"
+# bandwidth_down = "1 Gbit"
+
+[network.regions]             # region -> weight (probability a host lands there)
+us-east = 0.30
+us-west = 0.15
+europe  = 0.25
+asia    = 0.20
+sa      = 0.05
+africa  = 0.05
+
+[docker]
+# Base image that ships Shadow (arm64); :tcpfix carries the tcp send-cap fix.
+shadow_image = "kamilsa/shadow-arm:tcpfix"
+image_name = "proofsim-tree-shadow:local"
+rebuild = false
+
+[output]
+dir = "shadow-output"
